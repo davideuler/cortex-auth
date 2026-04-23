@@ -1,7 +1,7 @@
 class CortexAuth < Formula
   desc "Agent-centric secrets vault: store API keys and inject them at runtime"
   homepage "https://github.com/davideuler/cortex-auth"
-  version "0.1.1"
+  version "0.1.2"
   license "MIT"
 
   on_macos do

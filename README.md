@@ -21,7 +21,7 @@ brew install cortex-auth
 Download from the [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) page.
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 
 # Detect platform
 case "$(uname -s)-$(uname -m)" in
@@ -40,10 +40,10 @@ rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
 
 | Platform | Pre-built binary |
 |----------|-----------------|
-| macOS Apple Silicon (M1/M2/M3) | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3) | `cortex-auth-v0.1.2-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | — build from source |
-| Linux x86_64 | `cortex-auth-v0.1.1-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 | `cortex-auth-v0.1.1-aarch64-unknown-linux-musl.tar.gz` |
+| Linux x86_64 | `cortex-auth-v0.1.2-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 | `cortex-auth-v0.1.2-aarch64-unknown-linux-musl.tar.gz` |
 
 ### Build from source
 

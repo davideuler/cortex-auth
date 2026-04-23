@@ -21,7 +21,7 @@ brew install cortex-auth
 从 [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) 页面下载。
 
 ```bash
-VERSION=v0.1.1
+VERSION=v0.1.2
 
 # 自动识别平台
 case "$(uname -s)-$(uname -m)" in
@@ -40,10 +40,10 @@ rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
 
 | 平台 | 预编译包 |
 |------|--------|
-| macOS Apple Silicon（M1/M2/M3） | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Apple Silicon（M1/M2/M3） | `cortex-auth-v0.1.2-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | — 请从源码编译 |
-| Linux x86_64 | `cortex-auth-v0.1.1-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 | `cortex-auth-v0.1.1-aarch64-unknown-linux-musl.tar.gz` |
+| Linux x86_64 | `cortex-auth-v0.1.2-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 | `cortex-auth-v0.1.2-aarch64-unknown-linux-musl.tar.gz` |
 
 ### 从源码编译
 
