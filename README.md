@@ -15,7 +15,7 @@ brew install cortex-auth
 
 ### Direct download
 
-Download pre-built binaries from the [GitHub Releases](https://github.com/davideuler/CortexAuth/releases) page.
+Download pre-built binaries from the [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) page.
 
 ### Quick install (Linux / macOS)
 
@@ -32,7 +32,7 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 ARCHIVE="cortex-auth-${VERSION}-${TARGET}"
-curl -fLO "https://github.com/davideuler/CortexAuth/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
+curl -fLO "https://github.com/davideuler/cortex-auth/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
 tar xzf "${ARCHIVE}.tar.gz"
 sudo mv "${ARCHIVE}/cortex-server" "${ARCHIVE}/cortex-cli" /usr/local/bin/
 rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"

@@ -1,16 +1,16 @@
 class CortexAuth < Formula
   desc "Agent-centric secrets vault: store API keys and inject them at runtime"
-  homepage "https://github.com/davideuler/CortexAuth"
+  homepage "https://github.com/davideuler/cortex-auth"
   version "0.1.1"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/davideuler/CortexAuth/releases/download/v#{version}/cortex-auth-v#{version}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/davideuler/cortex-auth/releases/download/v#{version}/cortex-auth-v#{version}-aarch64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_AARCH64_APPLE_DARWIN_SHA256"
     end
     on_intel do
-      url "https://github.com/davideuler/CortexAuth/releases/download/v#{version}/cortex-auth-v#{version}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/davideuler/cortex-auth/releases/download/v#{version}/cortex-auth-v#{version}-x86_64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_X86_64_APPLE_DARWIN_SHA256"
     end
   end

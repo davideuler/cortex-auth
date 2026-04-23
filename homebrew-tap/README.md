@@ -1,6 +1,6 @@
 # homebrew-cortex-auth
 
-Homebrew tap for [CortexAuth](https://github.com/davideuler/CortexAuth) — an agent-centric secrets vault for AI agents and automated pipelines.
+Homebrew tap for [CortexAuth](https://github.com/davideuler/cortex-auth) — an agent-centric secrets vault for AI agents and automated pipelines.
 
 ## Install
 
@@ -26,4 +26,4 @@ brew untap davideuler/cortex-auth
 
 ## Usage
 
-See the [main repository](https://github.com/davideuler/CortexAuth) for full documentation.
+See the [main repository](https://github.com/davideuler/cortex-auth) for full documentation.
