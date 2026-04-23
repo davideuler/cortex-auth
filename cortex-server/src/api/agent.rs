@@ -4,8 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -14,7 +13,7 @@ use crate::{
     crypto,
     error::AppError,
     models::{
-        agent::{Agent, AgentClaims, AuthenticateRequest, AuthenticateResponse, SessionClaims},
+        agent::{Agent, AgentClaims},
         policy::Policy,
         project::{parse_env_file, DiscoverRequest, DiscoverResponse, SecretsResponse},
     },
@@ -23,74 +22,13 @@ use crate::{
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/authenticate", post(authenticate))
         .route("/discover", post(discover))
-        .route("/secrets/:project_name", get(get_secrets))
-        .route("/config/:project_name/:app_name", get(get_config))
 }
 
-async fn authenticate(
-    State(state): State<AppState>,
-    Json(req): Json<AuthenticateRequest>,
-) -> Result<Json<AuthenticateResponse>, AppError> {
-    let agent = sqlx::query_as::<_, Agent>(
-        "SELECT id, agent_id, jwt_secret_encrypted, description, namespace, created_at FROM agents WHERE agent_id = ?",
-    )
-    .bind(&req.agent_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
-
-    let jwt_secret = crypto::decrypt(&agent.jwt_secret_encrypted, &state.config.encryption_key)
-        .map_err(AppError::Internal)?;
-
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false;
-    validation.required_spec_claims.clear();
-
-    let token_data = decode::<AgentClaims>(
-        &req.auth_proof,
-        &DecodingKey::from_secret(jwt_secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|_| AppError::Unauthorized("Invalid auth_proof JWT".into()))?;
-
-    if token_data.claims.sub != req.agent_id {
-        return Err(AppError::Unauthorized(
-            "JWT subject does not match agent_id".into(),
-        ));
-    }
-
-    let now = Utc::now().timestamp() as u64;
-    let session_claims = SessionClaims {
-        sub: req.agent_id.clone(),
-        agent_id: req.agent_id.clone(),
-        namespace: agent.namespace.clone(),
-        iat: now,
-        exp: now + 3600,
-    };
-
-    let session_token = encode(
-        &Header::default(),
-        &session_claims,
-        &EncodingKey::from_secret(state.config.session_secret.as_bytes()),
-    )
-    .map_err(|e| AppError::Internal(anyhow::anyhow!("Token signing failed: {}", e)))?;
-
-    audit::write(
-        &state,
-        Some(&req.agent_id),
-        None,
-        "authenticate",
-        None,
-        "success",
-    )
-    .await;
-
-    Ok(Json(AuthenticateResponse {
-        session_token,
-        expires_in: 3600,
-    }))
+pub fn project_router() -> Router<AppState> {
+    Router::new()
+        .route("/secrets/:project_name", get(get_secrets))
+        .route("/config/:project_name/:app_name", get(get_config))
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
@@ -100,24 +38,6 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Unauthorized("Missing or invalid Authorization header".into()))
-}
-
-fn extract_session_claims(
-    headers: &HeaderMap,
-    session_secret: &str,
-) -> Result<SessionClaims, AppError> {
-    let token = extract_bearer_token(headers)?;
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = true;
-    validation.required_spec_claims.clear();
-
-    decode::<SessionClaims>(
-        &token,
-        &DecodingKey::from_secret(session_secret.as_bytes()),
-        &validation,
-    )
-    .map(|d| d.claims)
-    .map_err(|_| AppError::Unauthorized("Invalid or expired session token".into()))
 }
 
 fn agent_matches_pattern(agent_id: &str, pattern: &str) -> bool {
@@ -147,9 +67,7 @@ fn path_allowed_by_policies(path: &str, matching_policies: &[Policy]) -> bool {
 
     let denied: Vec<String> = matching_policies
         .iter()
-        .flat_map(|p| {
-            serde_json::from_str::<Vec<String>>(&p.denied_paths).unwrap_or_default()
-        })
+        .flat_map(|p| serde_json::from_str::<Vec<String>>(&p.denied_paths).unwrap_or_default())
         .collect();
 
     if denied.iter().any(|pat| path_matches_pattern(path, pat)) {
@@ -158,9 +76,7 @@ fn path_allowed_by_policies(path: &str, matching_policies: &[Policy]) -> bool {
 
     let allowed: Vec<String> = matching_policies
         .iter()
-        .flat_map(|p| {
-            serde_json::from_str::<Vec<String>>(&p.allowed_paths).unwrap_or_default()
-        })
+        .flat_map(|p| serde_json::from_str::<Vec<String>>(&p.allowed_paths).unwrap_or_default())
         .collect();
 
     if allowed.is_empty() {
@@ -171,13 +87,39 @@ fn path_allowed_by_policies(path: &str, matching_policies: &[Policy]) -> bool {
 }
 
 async fn discover(
-    headers: HeaderMap,
     State(state): State<AppState>,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
-    let claims = extract_session_claims(&headers, &state.config.session_secret)?;
-    let agent_id = claims.agent_id.clone();
-    let namespace = claims.namespace.clone();
+    let agent = sqlx::query_as::<_, Agent>(
+        "SELECT id, agent_id, jwt_secret_encrypted, description, namespace, created_at FROM agents WHERE agent_id = ?",
+    )
+    .bind(&req.agent_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
+
+    let jwt_secret = crypto::decrypt(&agent.jwt_secret_encrypted, &state.config.encryption_key)
+        .map_err(AppError::Internal)?;
+
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = false;
+    validation.required_spec_claims.clear();
+
+    let token_data = decode::<AgentClaims>(
+        &req.auth_proof,
+        &DecodingKey::from_secret(jwt_secret.as_bytes()),
+        &validation,
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid auth_proof JWT".into()))?;
+
+    if token_data.claims.sub != req.agent_id {
+        return Err(AppError::Unauthorized(
+            "JWT subject does not match agent_id".into(),
+        ));
+    }
+
+    let agent_id = agent.agent_id.clone();
+    let namespace = agent.namespace.clone();
 
     let project_name = &req.context.project_name;
     let env_keys = parse_env_file(&req.context.file_content);

@@ -8,13 +8,11 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 # Generate keys
 ENCRYPTION_KEY=$(openssl rand -hex 32)
 ADMIN_TOKEN=$(openssl rand -hex 16)
-SESSION_SECRET=$(openssl rand -hex 32)
 
 # Start the server
 DATABASE_URL=sqlite://cortex-auth.db \
 ENCRYPTION_KEY=$ENCRYPTION_KEY \
 ADMIN_TOKEN=$ADMIN_TOKEN \
-SESSION_SECRET=$SESSION_SECRET \
 cargo run --bin cortex-server
 
 # In another terminal — add a secret
@@ -23,14 +21,15 @@ curl -X POST http://localhost:3000/admin/secrets \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-your-key"}'
 
-# Discover project secrets
+# Discover project secrets (authenticate with agent_id + signed JWT)
+AUTH_PROOF=$(cortex-cli gen-token --agent-id my-agent --jwt-secret <agent_jwt_secret>)
 curl -X POST http://localhost:3000/agent/discover \
   -H "Content-Type: application/json" \
-  -d '{"context":{"project_name":"my-app","file_content":"OPENAI_API_KEY="}}'
+  -d "{\"agent_id\":\"my-agent\",\"auth_proof\":\"$AUTH_PROOF\",\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
 # Save the returned project_token!
 
 # Launch your app with secrets injected
-cargo run --bin cortex-cli -- \
+cargo run --bin cortex-cli -- run \
   --project my-app --token <project_token> --url http://localhost:3000 \
   -- python3 main.py
 ```
@@ -65,8 +64,9 @@ cargo build --release
 ## Security Model
 
 - Secrets encrypted at rest with AES-256-GCM (unique nonce per write)
-- Agent credentials stored encrypted; project tokens stored as SHA-256 hashes
+- Agent JWT secrets stored encrypted; project tokens stored as SHA-256 hashes
 - Admin operations protected by static `ADMIN_TOKEN`
+- `/agent/discover` authenticates agents directly via signed JWT (no separate session token)
 - Project access via one-time-issued `project_token` (must be saved — cannot be recovered)
 - Full audit log of all secret accesses
 - `cortex-cli` uses `exec()` — secrets never visible to a parent process

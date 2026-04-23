@@ -11,9 +11,6 @@ openssl rand -hex 32
 
 # Generate an admin token
 openssl rand -hex 16
-
-# Generate a session secret
-openssl rand -hex 32
 ```
 
 ### 2. Configure Environment
@@ -24,7 +21,6 @@ Create a `.env` file (never commit this):
 DATABASE_URL=sqlite://cortex-auth.db
 ENCRYPTION_KEY=<64-hex-chars-from-step-1>
 ADMIN_TOKEN=<your-admin-token>
-SESSION_SECRET=<your-session-secret>
 PORT=3000
 ```
 
@@ -159,36 +155,26 @@ curl -X POST http://localhost:3000/admin/policies \
 
 ## Agent API Examples
 
-### Agent Authentication
-
-An agent signs a JWT with its `jwt_secret` (HS256), then calls authenticate:
-
-```bash
-# In your agent code, sign a JWT with agent_id as "sub" field
-AUTH_PROOF=$(python3 -c "
-import jwt, time
-token = jwt.encode({'sub': 'agent-claude-code-01', 'iat': int(time.time())}, 
-                   'use-openssl-rand-hex-32-for-this', algorithm='HS256')
-print(token)
-")
-
-curl -X POST http://localhost:3000/agent/authenticate \
-  -H "Content-Type: application/json" \
-  -d "{\"agent_id\": \"agent-claude-code-01\", \"auth_proof\": \"$AUTH_PROOF\"}"
-# Response: {"session_token": "eyJ...", "expires_in": 3600}
-```
-
 ### Project Discovery
 
+Agents call `/agent/discover` directly, authenticating with `agent_id` and a signed JWT (`auth_proof`).
+Generate the `auth_proof` with `cortex-cli gen-token`:
+
 ```bash
+AUTH_PROOF=$(cortex-cli gen-token \
+  --agent-id agent-claude-code-01 \
+  --jwt-secret use-openssl-rand-hex-32-for-this)
+
 curl -X POST http://localhost:3000/agent/discover \
   -H "Content-Type: application/json" \
-  -d '{
-    "context": {
-      "project_name": "movie-translator",
-      "file_content": "OPENAI_API_KEY=\nDASHSCOPE_API_KEY="
+  -d "{
+    \"agent_id\": \"agent-claude-code-01\",
+    \"auth_proof\": \"$AUTH_PROOF\",
+    \"context\": {
+      \"project_name\": \"movie-translator\",
+      \"file_content\": \"OPENAI_API_KEY=\nDASHSCOPE_API_KEY=\"
     }
-  }'
+  }"
 # Response:
 # {
 #   "mapped_keys": {"OPENAI_API_KEY": "openai_api_key", "DASHSCOPE_API_KEY": "dashscope_api_key"},
@@ -203,7 +189,7 @@ curl -X POST http://localhost:3000/agent/discover \
 ### Fetch Secrets
 
 ```bash
-curl http://localhost:3000/agent/secrets/movie-translator \
+curl http://localhost:3000/project/secrets/movie-translator \
   -H "Authorization: Bearer <project_token>"
 # Response: {"env_vars": {"OPENAI_API_KEY": "sk-...", "DASHSCOPE_API_KEY": "dsk-..."}}
 ```
@@ -211,7 +197,7 @@ curl http://localhost:3000/agent/secrets/movie-translator \
 ### Render Config Template
 
 ```bash
-curl http://localhost:3000/agent/config/mail-project/himalaya \
+curl http://localhost:3000/project/config/mail-project/himalaya \
   -H "Authorization: Bearer <project_token>"
 # Response: rendered plain-text config file with secrets substituted
 ```
@@ -227,10 +213,20 @@ cargo build --release
 cp target/release/cortex-cli /usr/local/bin/
 ```
 
-### Basic Usage
+### Generate an auth_proof JWT
+
+Before calling `/agent/discover`, generate a signed JWT with your agent credentials:
 
 ```bash
-cortex-cli \
+AUTH_PROOF=$(cortex-cli gen-token --agent-id my-agent --jwt-secret <jwt_secret>)
+```
+
+Then use `$AUTH_PROOF` in your discover request body.
+
+### Launch a process with secrets
+
+```bash
+cortex-cli run \
   --project my-app \
   --token <project_token> \
   --url http://localhost:3000 \
@@ -244,18 +240,20 @@ export CORTEX_PROJECT=my-app
 export CORTEX_TOKEN=<project_token>
 export CORTEX_URL=http://cortex-server:3000
 
-cortex-cli -- ./start.sh
+cortex-cli run -- ./start.sh
 ```
 
 ### Help
 
 ```bash
 cortex-cli --help
+cortex-cli run --help
+cortex-cli gen-token --help
 ```
 
 ### How It Works
 
-1. `cortex-cli` fetches secrets from `/agent/secrets/<project>`
+1. `cortex-cli run` fetches secrets from `/project/secrets/<project>`
 2. Injects the returned env vars into the process environment
 3. `exec()`s the specified command — the CLI process is **replaced** by the child
 4. The child process inherits all injected secrets as env vars
@@ -269,7 +267,7 @@ cortex-cli --help
 # ANTHROPIC_API_KEY=
 
 # After setting up secrets in CortexAuth and running discover:
-cortex-cli \
+cortex-cli run \
   --project my-ai-agent \
   --token $PROJECT_TOKEN \
   --url http://cortex:3000 \
@@ -288,7 +286,6 @@ The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its environme
 |----------|----------|-------------|
 | `ENCRYPTION_KEY` | Yes | 64 hex chars (32 bytes) for AES-256-GCM |
 | `ADMIN_TOKEN` | Yes | Static token for admin API access |
-| `SESSION_SECRET` | Yes | Secret for signing agent session JWTs |
 | `DATABASE_URL` | No | SQLite path (default: `sqlite://cortex-auth.db`) |
 | `PORT` | No | HTTP listen port (default: 3000) |
 

@@ -44,7 +44,7 @@ fn make_agent_jwt(agent_id: &str, jwt_secret: &str) -> String {
     .unwrap()
 }
 
-/// Creates app with two KEY_VALUE secrets and a default agent. Returns (app, session_token).
+/// Creates app with two KEY_VALUE secrets and a default agent. Returns (app, auth_proof).
 async fn setup_app_with_secrets() -> (axum::Router, String) {
     let app = setup_test_app().await;
 
@@ -60,20 +60,6 @@ async fn setup_app_with_secrets() -> (axum::Router, String) {
         ))
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
-
-    // Authenticate to get session token
-    let auth_proof = make_agent_jwt("discover-agent", "discover-jwt-secret");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/authenticate")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"agent_id": "discover-agent", "auth_proof": auth_proof}).to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
-    let session_token = body["session_token"].as_str().unwrap().to_string();
 
     // Create two KEY_VALUE secrets in default namespace
     for (path, val) in [
@@ -92,29 +78,8 @@ async fn setup_app_with_secrets() -> (axum::Router, String) {
         app.clone().oneshot(req).await.unwrap();
     }
 
-    (app, session_token)
-}
-
-/// Creates app with an agent and returns (app, jwt_secret) for auth endpoint tests.
-async fn setup_app_with_agent() -> (axum::Router, String) {
-    let app = setup_test_app().await;
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({
-                "agent_id": "agent-claude-test",
-                "jwt_secret": "test-jwt-secret-for-signing",
-            })
-            .to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
-
-    (app, "test-jwt-secret-for-signing".to_string())
+    let auth_proof = make_agent_jwt("discover-agent", "discover-jwt-secret");
+    (app, auth_proof)
 }
 
 // ====================== SECRET CRUD TESTS ======================
@@ -349,60 +314,20 @@ async fn test_create_list_delete_policy() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-// ====================== AGENT AUTH TESTS ======================
-
-#[tokio::test]
-async fn test_agent_authenticate_success() {
-    let (app, jwt_secret) = setup_app_with_agent().await;
-    let auth_proof = make_agent_jwt("agent-claude-test", &jwt_secret);
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/authenticate")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"agent_id": "agent-claude-test", "auth_proof": auth_proof}).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
-    assert!(body["session_token"].as_str().is_some());
-    assert_eq!(body["expires_in"], 3600);
-}
-
-#[tokio::test]
-async fn test_agent_authenticate_wrong_secret() {
-    let (app, _) = setup_app_with_agent().await;
-    let auth_proof = make_agent_jwt("agent-claude-test", "wrong-secret");
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/authenticate")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"agent_id": "agent-claude-test", "auth_proof": auth_proof}).to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
 // ====================== DISCOVER + SECRETS TESTS ======================
 
 #[tokio::test]
 async fn test_discover_full_match() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
             json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
                 "context": {
                     "project_name": "movie-translator",
                     "file_content": "OPENAI_API_KEY=\nDASHSCOPE_API_KEY="
@@ -423,9 +348,10 @@ async fn test_discover_full_match() {
 }
 
 #[tokio::test]
-async fn test_discover_requires_session_token() {
+async fn test_discover_requires_valid_auth() {
     let (app, _) = setup_app_with_secrets().await;
 
+    // Missing agent_id and auth_proof returns 422 (unprocessable entity)
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
@@ -436,21 +362,44 @@ async fn test_discover_requires_session_token() {
         ))
         .unwrap();
 
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::UNPROCESSABLE_ENTITY
+            || resp.status() == StatusCode::BAD_REQUEST
+    );
+
+    // Wrong jwt_secret returns 401
+    let bad_proof = make_agent_jwt("discover-agent", "wrong-secret");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": bad_proof,
+                "context": {"project_name": "test", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
 async fn test_discover_partial_match() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
             json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
                 "context": {
                     "project_name": "partial-project",
                     "file_content": "OPENAI_API_KEY=\nMISSING_KEY="
@@ -471,15 +420,16 @@ async fn test_discover_partial_match() {
 
 #[tokio::test]
 async fn test_get_secrets_with_valid_token() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
             json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
                 "context": {
                     "project_name": "my-project",
                     "file_content": "OPENAI_API_KEY=\nDASHSCOPE_API_KEY="
@@ -495,7 +445,7 @@ async fn test_get_secrets_with_valid_token() {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/agent/secrets/my-project")
+        .uri("/project/secrets/my-project")
         .header("authorization", format!("Bearer {}", project_token))
         .body(Body::empty())
         .unwrap();
@@ -509,23 +459,26 @@ async fn test_get_secrets_with_valid_token() {
 
 #[tokio::test]
 async fn test_get_secrets_invalid_token() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "guarded-project", "file_content": "OPENAI_API_KEY="}})
-                .to_string(),
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "guarded-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
         ))
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
 
     let req = Request::builder()
         .method("GET")
-        .uri("/agent/secrets/guarded-project")
+        .uri("/project/secrets/guarded-project")
         .header("authorization", "Bearer wrong-token-here")
         .body(Body::empty())
         .unwrap();
@@ -538,7 +491,7 @@ async fn test_get_secrets_invalid_token() {
 
 #[tokio::test]
 async fn test_get_config_template() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     let template = "[smtp]\npassword = {{openai_api_key}}\nhost = mail.example.com";
     let req = Request::builder()
@@ -561,10 +514,13 @@ async fn test_get_config_template() {
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "mail-project", "file_content": "OPENAI_API_KEY="}})
-                .to_string(),
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "mail-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -573,7 +529,7 @@ async fn test_get_config_template() {
 
     let req = Request::builder()
         .method("GET")
-        .uri("/agent/config/mail-project/himalaya")
+        .uri("/project/config/mail-project/himalaya")
         .header("authorization", format!("Bearer {}", token))
         .body(Body::empty())
         .unwrap();
@@ -592,57 +548,56 @@ async fn test_get_config_template() {
 
 #[tokio::test]
 async fn test_discover_conflict_on_rediscover() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
-    let payload = json!({
-        "context": {
-            "project_name": "conflict-project",
-            "file_content": "OPENAI_API_KEY="
+    let make_discover_req = |proof: &str, regenerate: bool| {
+        let mut body = json!({
+            "agent_id": "discover-agent",
+            "auth_proof": proof,
+            "context": {
+                "project_name": "conflict-project",
+                "file_content": "OPENAI_API_KEY="
+            }
+        });
+        if regenerate {
+            body["regenerate_token"] = json!(true);
         }
-    })
-    .to_string();
+        body.to_string()
+    };
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
-        .body(Body::from(payload.clone()))
+        .body(Body::from(make_discover_req(&auth_proof, false)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Second discover of same project without regenerate_token → conflict
+    let proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
-        .body(Body::from(payload.clone()))
+        .body(Body::from(make_discover_req(&proof2, false)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
+    // With regenerate_token=true → OK and new token
+    let proof3 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
-        .body(Body::from(
-            json!({
-                "context": {"project_name": "conflict-project", "file_content": "OPENAI_API_KEY="},
-                "regenerate_token": true
-            })
-            .to_string(),
-        ))
+        .body(Body::from(make_discover_req(&proof3, true)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert!(body["project_token"].as_str().is_some());
-    assert!(!body["project_token"]
-        .as_str()
-        .unwrap()
-        .starts_with("__existing__"));
+    assert!(!body["project_token"].as_str().unwrap().starts_with("__existing__"));
 }
 
 // ====================== NAMESPACE ISOLATION TEST ======================
@@ -690,27 +645,19 @@ async fn test_namespace_isolation() {
     app.clone().oneshot(req).await.unwrap();
 
     let auth_proof = make_agent_jwt("default-agent", "default-secret");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/authenticate")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"agent_id": "default-agent", "auth_proof": auth_proof}).to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
-    let session_token = body["session_token"].as_str().unwrap().to_string();
 
     // Discover: default-agent should only see "default_secret", not "prod_secret"
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "ns-test", "file_content": "PROD_SECRET=\nDEFAULT_SECRET="}})
-                .to_string(),
+            json!({
+                "agent_id": "default-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "ns-test", "file_content": "PROD_SECRET=\nDEFAULT_SECRET="}
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -761,7 +708,7 @@ async fn test_policy_denies_path() {
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
 
-    // Create agent and authenticate
+    // Create agent
     let req = Request::builder()
         .method("POST")
         .uri("/admin/agents")
@@ -774,27 +721,19 @@ async fn test_policy_denies_path() {
     app.clone().oneshot(req).await.unwrap();
 
     let auth_proof = make_agent_jwt("policy-agent", "policy-secret");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/authenticate")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"agent_id": "policy-agent", "auth_proof": auth_proof}).to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
-    let session_token = body["session_token"].as_str().unwrap().to_string();
 
     // Discover: denied_key should not be mapped
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "policy-project", "file_content": "ALLOWED_KEY=\nDENIED_KEY="}})
-                .to_string(),
+            json!({
+                "agent_id": "policy-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "policy-project", "file_content": "ALLOWED_KEY=\nDENIED_KEY="}
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -809,17 +748,20 @@ async fn test_policy_denies_path() {
 
 #[tokio::test]
 async fn test_audit_log_list() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     // Perform a discover to generate an audit log entry
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "audit-project", "file_content": "OPENAI_API_KEY="}})
-                .to_string(),
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "audit-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
         ))
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
@@ -843,17 +785,20 @@ async fn test_audit_log_list() {
 
 #[tokio::test]
 async fn test_rotate_key() {
-    let (app, session_token) = setup_app_with_secrets().await;
+    let (app, auth_proof) = setup_app_with_secrets().await;
 
     // Discover first to register a project
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {}", session_token))
         .body(Body::from(
-            json!({"context": {"project_name": "rotate-project", "file_content": "OPENAI_API_KEY="}})
-                .to_string(),
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "rotate-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -885,7 +830,7 @@ async fn test_rotate_key() {
     // Project token still exists (not rotated)
     let req = Request::builder()
         .method("GET")
-        .uri("/agent/secrets/rotate-project")
+        .uri("/project/secrets/rotate-project")
         .header("authorization", format!("Bearer {}", project_token))
         .body(Body::empty())
         .unwrap();

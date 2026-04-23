@@ -423,7 +423,9 @@ name = "cortex-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "jsonwebtoken",
  "reqwest",
  "serde",
  "serde_json",

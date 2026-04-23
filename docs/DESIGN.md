@@ -11,12 +11,12 @@ CortexAuth is a lightweight, Rust-based secrets and configuration management ser
 │                    CortexAuth Server                     │
 │                                                         │
 │  ┌─────────────────┐    ┌──────────────────────────┐   │
-│  │   Admin API     │    │      Agent API           │   │
-│  │ /admin/*        │    │  /agent/authenticate     │   │
-│  │                 │    │  /agent/discover          │   │
-│  │ - Secrets CRUD  │    │  /agent/secrets/:project  │   │
-│  │ - Agent mgmt    │    │  /agent/config/:p/:app    │   │
-│  │ - Policy mgmt   │    └──────────────────────────┘   │
+│  │   Admin API     │    │      Agent/Project API   │   │
+│  │ /admin/*        │    │  /agent/discover         │   │
+│  │                 │    │  /project/secrets/:proj  │   │
+│  │ - Secrets CRUD  │    │  /project/config/:p/:app │   │
+│  │ - Agent mgmt    │    └──────────────────────────┘   │
+│  │ - Policy mgmt   │                                    │
 │  │ - Project list  │                                    │
 │  └─────────────────┘                                    │
 │                                                         │
@@ -49,7 +49,7 @@ The core HTTP service built with axum + SQLite.
 
 **Authentication Model**
 - **Admin operations**: Protected by `X-Admin-Token` header (static token from env)
-- **Agent operations**: JWT-based — agent signs a JWT with their `jwt_secret`, server verifies and issues a session token
+- **Agent discover**: JWT-based — agent sends `agent_id` + `auth_proof` (JWT signed with `jwt_secret`) directly in the request body; no separate session token issued
 - **Project access**: Token-based — a `project_token` (SHA-256 hashed at rest) is issued during discovery
 
 **Secret Key Architecture**
@@ -76,21 +76,20 @@ All endpoints require `X-Admin-Token` header.
 | DELETE | `/admin/policies/:id` | Remove policy |
 | GET | `/admin/projects` | List registered projects |
 
-### 3. Agent API (`/agent/*`)
-
-Public endpoints for agent and project use.
+### 3. Agent API (`/agent/*`) and Project API (`/project/*`)
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| POST | `/agent/authenticate` | None | Verify agent JWT, get session token |
-| POST | `/agent/discover` | None | Analyze .env.example, register project |
-| GET | `/agent/secrets/:project` | Bearer project_token | Fetch mapped env vars |
-| GET | `/agent/config/:project/:app` | Bearer project_token | Render config template |
+| POST | `/agent/discover` | `agent_id` + `auth_proof` in body | Analyze .env file, register project |
+| GET | `/project/secrets/:project` | Bearer project_token | Fetch mapped env vars |
+| GET | `/project/config/:project/:app` | Bearer project_token | Render config template |
+
+`/agent/discover` is called by agents at project start time. `/project/*` routes are called by `cortex-cli` at runtime.
 
 ### 4. cortex-cli
 
 A thin CLI launcher that:
-1. Calls `/agent/secrets/:project_name` with the project token
+1. Calls `/project/secrets/:project_name` with the project token
 2. Merges returned env vars into the current process environment
 3. `exec()`s the target command (replaces itself with the child process)
 4. Returns the child's exit code
@@ -102,15 +101,15 @@ Secrets are never printed; `exec()` ensures the CLI process is replaced by the c
 ### Project Setup Flow
 ```
 Admin → POST /admin/secrets {openai_api_key, ...}
-Agent → POST /agent/discover {project_name, file_content: "OPENAI_API_KEY=\n..."}
-Server → matches env vars to secrets → stores project + mappings → returns project_token
+Agent → POST /agent/discover {agent_id, auth_proof, context: {project_name, file_content: "OPENAI_API_KEY=\n..."}}
+Server → verifies agent JWT → matches env vars to secrets → stores project + mappings → returns project_token
 Admin stores project_token in CI/CD secrets
 ```
 
 ### Runtime Flow (cortex-cli)
 ```
 cortex-cli --project my-app --token <project_token> --url http://cortex:3000 -- ./start.sh
-→ GET /agent/secrets/my-app (Bearer project_token)
+→ GET /project/secrets/my-app (Bearer project_token)
 → Injects {OPENAI_API_KEY: "sk-...", ...} into env
 → exec("./start.sh") with injected environment
 ```

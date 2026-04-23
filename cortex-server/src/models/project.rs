@@ -20,6 +20,8 @@ pub struct DiscoverContext {
 
 #[derive(Debug, Deserialize)]
 pub struct DiscoverRequest {
+    pub agent_id: String,
+    pub auth_proof: String,
     pub context: DiscoverContext,
     pub regenerate_token: Option<bool>,
 }

@@ -18,6 +18,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/", get(dashboard::serve))
         .nest("/admin", api::admin::router())
         .nest("/agent", api::agent::router())
+        .nest("/project", api::agent::project_router())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

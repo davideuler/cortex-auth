@@ -5,7 +5,6 @@ pub struct AppConfig {
     pub database_url: String,
     pub encryption_key: [u8; 32],
     pub admin_token: String,
-    pub session_secret: String,
     pub port: u16,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
@@ -25,9 +24,6 @@ impl AppConfig {
         let admin_token =
             std::env::var("ADMIN_TOKEN").context("ADMIN_TOKEN env var is required")?;
 
-        let session_secret =
-            std::env::var("SESSION_SECRET").context("SESSION_SECRET env var is required")?;
-
         let port = std::env::var("PORT")
             .unwrap_or_else(|_| "3000".to_string())
             .parse::<u16>()
@@ -40,7 +36,6 @@ impl AppConfig {
             database_url,
             encryption_key,
             admin_token,
-            session_secret,
             port,
             tls_cert_file,
             tls_key_file,
@@ -55,7 +50,6 @@ impl AppConfig {
             database_url: "sqlite::memory:".to_string(),
             encryption_key: key,
             admin_token: "test-admin-token".to_string(),
-            session_secret: "test-session-secret-32-chars-min".to_string(),
             port: 3000,
             tls_cert_file: None,
             tls_key_file: None,
