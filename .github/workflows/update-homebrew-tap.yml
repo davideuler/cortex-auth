@@ -1,0 +1,83 @@
+name: Update Homebrew Tap
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  update-tap:
+    name: Update homebrew-cortex-auth formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute SHA256 for macOS tarballs
+        id: sha
+        env:
+          VERSION: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          BASE="https://github.com/${GH_REPO}/releases/download/${VERSION}"
+
+          AARCH64_FILE="cortex-auth-${VERSION}-aarch64-apple-darwin.tar.gz"
+          X86_64_FILE="cortex-auth-${VERSION}-x86_64-apple-darwin.tar.gz"
+
+          curl -fLO "${BASE}/${AARCH64_FILE}"
+          curl -fLO "${BASE}/${X86_64_FILE}"
+
+          echo "aarch64=$(sha256sum ${AARCH64_FILE} | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x86_64=$(sha256sum ${X86_64_FILE}   | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: davideuler/homebrew-cortex-auth
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ steps.sha.outputs.version }}
+          SHA_AARCH64: ${{ steps.sha.outputs.aarch64 }}
+          SHA_X86_64: ${{ steps.sha.outputs.x86_64 }}
+        run: |
+          FORMULA="tap/Formula/cortex-auth.rb"
+
+          sed -i "s|version \".*\"|version \"${VERSION}\"|" "$FORMULA"
+          sed -i "s|sha256 \"PLACEHOLDER_AARCH64_APPLE_DARWIN_SHA256\"|sha256 \"${SHA_AARCH64}\"|" "$FORMULA"
+          sed -i "s|sha256 \"PLACEHOLDER_X86_64_APPLE_DARWIN_SHA256\"|sha256 \"${SHA_X86_64}\"|"   "$FORMULA"
+
+          # For subsequent releases, replace the previous SHA values too
+          python3 - <<'EOF'
+          import re, os
+
+          formula = open("tap/Formula/cortex-auth.rb").read()
+
+          ver     = os.environ["VERSION"]
+          sha_arm = os.environ["SHA_AARCH64"]
+          sha_x86 = os.environ["SHA_X86_64"]
+
+          # Update version
+          formula = re.sub(r'version "[^"]+"', f'version "{ver}"', formula)
+
+          # Update sha256 values — first occurrence is arm, second is x86_64
+          sha_pattern = re.compile(r'(sha256 ")[^"]+(")')
+          occurrences = list(sha_pattern.finditer(formula))
+          if len(occurrences) >= 2:
+              # Replace from end to avoid offset shifts
+              formula = formula[:occurrences[1].start()] + f'sha256 "{sha_x86}"' + formula[occurrences[1].end():]
+              formula = formula[:occurrences[0].start()] + f'sha256 "{sha_arm}"' + formula[occurrences[0].end():]
+
+          open("tap/Formula/cortex-auth.rb", "w").write(formula)
+          print(formula)
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.sha.outputs.version }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cortex-auth.rb
+          git diff --cached --quiet || git commit -m "cortex-auth ${VERSION}"
+          git push

@@ -6,7 +6,16 @@
 
 ## 安装
 
-从 [GitHub Releases](https://github.com/your-org/cortex-auth/releases) 页面下载预编译的二进制文件。
+### Homebrew（macOS）
+
+```bash
+brew tap davideuler/cortex-auth
+brew install cortex-auth
+```
+
+### 直接下载
+
+从 [GitHub Releases](https://github.com/davideuler/CortexAuth/releases) 页面下载预编译的二进制文件。
 
 ### 一键安装（Linux / macOS）
 
@@ -23,7 +32,7 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 ARCHIVE="cortex-auth-${VERSION}-${TARGET}"
-curl -fLO "https://github.com/your-org/cortex-auth/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
+curl -fLO "https://github.com/davideuler/CortexAuth/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
 tar xzf "${ARCHIVE}.tar.gz"
 sudo mv "${ARCHIVE}/cortex-server" "${ARCHIVE}/cortex-cli" /usr/local/bin/
 rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
