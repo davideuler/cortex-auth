@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon (native)
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+
+          # macOS Intel (native)
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+
+          # Linux x86_64 — statically linked musl
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+
+          # Linux ARM64 — statically linked musl (via cross)
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -q -y musl-tools
+
+      - name: Install cross (for aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@cross
+
+      - name: Build with cross (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --workspace --target ${{ matrix.target }}
+
+      - name: Build natively
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package binaries
+        id: package
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE_NAME="cortex-auth-${TAG}-${TARGET}"
+
+          mkdir -p "dist/${ARCHIVE_NAME}"
+
+          # Copy binaries (no extension on unix)
+          cp "target/${TARGET}/release/cortex-server" "dist/${ARCHIVE_NAME}/"
+          cp "target/${TARGET}/release/cortex-cli"    "dist/${ARCHIVE_NAME}/"
+
+          # Create archive
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "archive=${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "archive_path=dist/${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.archive_path }}
+          generate_release_notes: true
