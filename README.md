@@ -145,6 +145,51 @@ cortex-cli run \
 | `cortex-server` | HTTP API server (axum + SQLite). Stores secrets encrypted with AES-256-GCM. |
 | `cortex-cli` | CLI launcher that fetches secrets and `exec()`s your process with them injected as env vars. |
 
+## Agent Skills Integration
+
+The `cortex-skills/` directory contains a ready-to-use skill following the
+[Agent Skills open standard](https://developers.openai.com/codex/skills) — the same
+`SKILL.md` format works across all major agent frameworks. Once installed, your agent
+autonomously authenticates with Cortex and injects secrets without any human prompting.
+
+| Agent | Skills directory | Docs |
+|-------|-----------------|------|
+| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude/skills/` (global) · `.claude/skills/` (project) | [Extend Claude with skills](https://code.claude.com/docs/en/skills) |
+| [Codex CLI](https://developers.openai.com/codex/skills) | `~/.codex/skills/` (global) · `.agents/skills/` (project) | [Agent Skills – Codex](https://developers.openai.com/codex/skills) |
+| [OpenCode](https://opencode.ai/docs/skills/) | `~/.opencode/skills/` (global) · `.opencode/skills/` (project) | [Agent Skills · OpenCode](https://opencode.ai/docs/skills/) |
+| [OpenClaw](https://docs.openclaw.ai/tools/skills) | `~/.openclaw/skills/` (global) · `skills/` (workspace) | [Skills – OpenClaw](https://docs.openclaw.ai/tools/skills) |
+| [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) | `~/.hermes/skills/` (local) · `~/.agents/skills/` (shared) | [Skills System · Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) |
+
+```bash
+# 1. Clone (or use your existing copy of) cortex-auth
+git clone https://github.com/davideuler/cortex-auth.git /tmp/cortex-auth
+
+# 2. Install the skill for your agent — pick one:
+
+# Claude Code (global)
+cp -r /tmp/cortex-auth/cortex-skills ~/.claude/skills/cortex-secrets
+
+# Codex CLI (global)
+cp -r /tmp/cortex-auth/cortex-skills ~/.codex/skills/cortex-secrets
+
+# OpenCode (global)
+cp -r /tmp/cortex-auth/cortex-skills ~/.opencode/skills/cortex-secrets
+
+# OpenClaw (global)
+cp -r /tmp/cortex-auth/cortex-skills ~/.openclaw/skills/cortex-secrets
+
+# Hermes Agent (local)
+cp -r /tmp/cortex-auth/cortex-skills ~/.hermes/skills/cortex-secrets
+```
+
+To keep the skill in sync with future cortex-auth updates, use symlinks instead of copying:
+```bash
+ln -sf /tmp/cortex-auth/cortex-skills ~/.claude/skills/cortex-secrets
+```
+
+For project-scoped installation (committed alongside your code), copy into the
+agent-specific project directory (e.g. `.claude/skills/cortex-secrets/`).
+
 ## Documentation
 
 - [Design & Architecture](docs/DESIGN.md) — System design, security model, data flow

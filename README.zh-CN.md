@@ -145,6 +145,51 @@ cortex-cli run \
 | `cortex-server` | HTTP API 服务器（axum + SQLite），使用 AES-256-GCM 加密存储密钥。 |
 | `cortex-cli` | CLI 启动器，获取密钥后通过 `exec()` 将其注入为环境变量并启动子进程。 |
 
+## Agent Skills 集成
+
+`cortex-skills/` 目录包含一个开箱即用的 Skill，遵循
+[Agent Skills 开放标准](https://developers.openai.com/codex/skills)——
+同一份 `SKILL.md` 可在所有主流 Agent 框架中使用。安装后，Agent 将自主完成
+Cortex 认证和密钥注入，无需任何人工提示。
+
+| Agent | Skills 目录 | 文档 |
+|-------|------------|------|
+| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude/skills/`（全局）· `.claude/skills/`（项目） | [Extend Claude with skills](https://code.claude.com/docs/en/skills) |
+| [Codex CLI](https://developers.openai.com/codex/skills) | `~/.codex/skills/`（全局）· `.agents/skills/`（项目） | [Agent Skills – Codex](https://developers.openai.com/codex/skills) |
+| [OpenCode](https://opencode.ai/docs/skills/) | `~/.opencode/skills/`（全局）· `.opencode/skills/`（项目） | [Agent Skills · OpenCode](https://opencode.ai/docs/skills/) |
+| [OpenClaw](https://docs.openclaw.ai/tools/skills) | `~/.openclaw/skills/`（全局）· `skills/`（工作区） | [Skills – OpenClaw](https://docs.openclaw.ai/tools/skills) |
+| [Hermes Agent](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) | `~/.hermes/skills/`（本地）· `~/.agents/skills/`（共享） | [Skills System · Hermes](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills) |
+
+```bash
+# 1. 克隆（或使用已有的）cortex-auth 仓库
+git clone https://github.com/davideuler/cortex-auth.git /tmp/cortex-auth
+
+# 2. 将 skill 安装到对应 Agent——按需选择：
+
+# Claude Code（全局）
+cp -r /tmp/cortex-auth/cortex-skills ~/.claude/skills/cortex-secrets
+
+# Codex CLI（全局）
+cp -r /tmp/cortex-auth/cortex-skills ~/.codex/skills/cortex-secrets
+
+# OpenCode（全局）
+cp -r /tmp/cortex-auth/cortex-skills ~/.opencode/skills/cortex-secrets
+
+# OpenClaw（全局）
+cp -r /tmp/cortex-auth/cortex-skills ~/.openclaw/skills/cortex-secrets
+
+# Hermes Agent（本地）
+cp -r /tmp/cortex-auth/cortex-skills ~/.hermes/skills/cortex-secrets
+```
+
+如需在 cortex-auth 更新时自动同步，可使用符号链接替代复制：
+```bash
+ln -sf /tmp/cortex-auth/cortex-skills ~/.claude/skills/cortex-secrets
+```
+
+如需项目级安装（与代码一起提交），将 skill 复制到对应 Agent 的项目目录下
+（例如 `.claude/skills/cortex-secrets/`）。
+
 ## 文档
 
 - [设计与架构](docs/DESIGN.md) — 系统设计、安全模型、数据流
