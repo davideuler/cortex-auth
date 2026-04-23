@@ -10,8 +10,8 @@ class CortexAuth < Formula
       sha256 "PLACEHOLDER_AARCH64_APPLE_DARWIN_SHA256"
     end
     on_intel do
-      url "https://github.com/davideuler/cortex-auth/releases/download/v#{version}/cortex-auth-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "PLACEHOLDER_X86_64_APPLE_DARWIN_SHA256"
+      raise "Pre-built binaries are only available for Apple Silicon (arm64). " \
+            "Please build from source: https://github.com/davideuler/cortex-auth"
     end
   end
 
@@ -21,7 +21,6 @@ class CortexAuth < Formula
   end
 
   test do
-    # cortex-server requires env vars to start; just verify the binary exists and exits cleanly
     assert_predicate bin/"cortex-server", :exist?
     assert_predicate bin/"cortex-cli", :exist?
     system bin/"cortex-cli", "gen-token", "--help"

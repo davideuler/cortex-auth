@@ -6,18 +6,19 @@
 
 ## 安装
 
-### Homebrew（macOS）
+### Homebrew（macOS Apple Silicon）
 
 ```bash
 brew tap davideuler/cortex-auth
 brew install cortex-auth
 ```
 
-### 直接下载
+> **注意：** Homebrew tap 仅提供 **Apple Silicon（M1/M2/M3）** 的预编译二进制文件。
+> macOS Intel 用户请参考[从源码编译](#从源码编译)。
 
-从 [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) 页面下载预编译的二进制文件。
+### 预编译二进制（Linux / macOS Apple Silicon）
 
-### 一键安装（Linux / macOS）
+从 [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) 页面下载。
 
 ```bash
 VERSION=v0.1.1
@@ -25,10 +26,9 @@ VERSION=v0.1.1
 # 自动识别平台
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  TARGET=aarch64-apple-darwin ;;
-  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
   Linux-x86_64)  TARGET=x86_64-unknown-linux-musl ;;
   Linux-aarch64) TARGET=aarch64-unknown-linux-musl ;;
-  *) echo "不支持的平台"; exit 1 ;;
+  *) echo "该平台暂无预编译包，请参考下方从源码编译"; exit 1 ;;
 esac
 
 ARCHIVE="cortex-auth-${VERSION}-${TARGET}"
@@ -38,20 +38,20 @@ sudo mv "${ARCHIVE}/cortex-server" "${ARCHIVE}/cortex-cli" /usr/local/bin/
 rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
 ```
 
-### 手动下载
-
-| 平台 | 安装包 |
+| 平台 | 预编译包 |
 |------|--------|
-| macOS Apple Silicon | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `cortex-auth-v0.1.1-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon（M1/M2/M3） | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | — 请从源码编译 |
 | Linux x86_64 | `cortex-auth-v0.1.1-x86_64-unknown-linux-musl.tar.gz` |
 | Linux ARM64 | `cortex-auth-v0.1.1-aarch64-unknown-linux-musl.tar.gz` |
 
-每个安装包包含两个二进制文件：`cortex-server` 和 `cortex-cli`。解压后将它们放到 `PATH` 中的任意目录即可。
-
 ### 从源码编译
 
+需要安装 [Rust](https://rustup.rs)（stable 版本）。
+
 ```bash
+git clone https://github.com/davideuler/cortex-auth.git
+cd cortex-auth
 cargo build --release
 # 产物路径：target/release/cortex-server  target/release/cortex-cli
 ```

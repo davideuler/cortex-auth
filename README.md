@@ -6,18 +6,19 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 
 ## Installation
 
-### Homebrew (macOS)
+### Homebrew (macOS Apple Silicon)
 
 ```bash
 brew tap davideuler/cortex-auth
 brew install cortex-auth
 ```
 
-### Direct download
+> **Note:** The Homebrew tap provides pre-built binaries for **Apple Silicon (M1/M2/M3) only**.
+> macOS Intel users should [build from source](#build-from-source).
 
-Download pre-built binaries from the [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) page.
+### Pre-built binaries (Linux / macOS Apple Silicon)
 
-### Quick install (Linux / macOS)
+Download from the [GitHub Releases](https://github.com/davideuler/cortex-auth/releases) page.
 
 ```bash
 VERSION=v0.1.1
@@ -25,10 +26,9 @@ VERSION=v0.1.1
 # Detect platform
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)  TARGET=aarch64-apple-darwin ;;
-  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
   Linux-x86_64)  TARGET=x86_64-unknown-linux-musl ;;
   Linux-aarch64) TARGET=aarch64-unknown-linux-musl ;;
-  *) echo "Unsupported platform"; exit 1 ;;
+  *) echo "No pre-built binary for this platform — see Build from source below"; exit 1 ;;
 esac
 
 ARCHIVE="cortex-auth-${VERSION}-${TARGET}"
@@ -38,20 +38,20 @@ sudo mv "${ARCHIVE}/cortex-server" "${ARCHIVE}/cortex-cli" /usr/local/bin/
 rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
 ```
 
-### Manual download
-
-| Platform | Archive |
-|----------|---------|
-| macOS Apple Silicon | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `cortex-auth-v0.1.1-x86_64-apple-darwin.tar.gz` |
+| Platform | Pre-built binary |
+|----------|-----------------|
+| macOS Apple Silicon (M1/M2/M3) | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | — build from source |
 | Linux x86_64 | `cortex-auth-v0.1.1-x86_64-unknown-linux-musl.tar.gz` |
 | Linux ARM64 | `cortex-auth-v0.1.1-aarch64-unknown-linux-musl.tar.gz` |
 
-Each archive contains two binaries: `cortex-server` and `cortex-cli`. Extract and place them anywhere on your `PATH`.
-
 ### Build from source
 
+Requires [Rust](https://rustup.rs) (stable).
+
 ```bash
+git clone https://github.com/davideuler/cortex-auth.git
+cd cortex-auth
 cargo build --release
 # Binaries at: target/release/cortex-server  target/release/cortex-cli
 ```
