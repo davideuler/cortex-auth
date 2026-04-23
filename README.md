@@ -1,6 +1,51 @@
 # CortexAuth — Agent-Centric Secrets & Configuration Service
 
+[中文文档](README.zh-CN.md)
+
 A lightweight, Rust-based secrets vault designed for AI agents and automated pipelines. Store API keys and configuration securely, discover which secrets your project needs, and inject them at runtime — without ever hardcoding secrets in source code.
+
+## Installation
+
+Download pre-built binaries from the [GitHub Releases](https://github.com/your-org/cortex-auth/releases) page.
+
+### Quick install (Linux / macOS)
+
+```bash
+VERSION=v0.1.1
+
+# Detect platform
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  TARGET=aarch64-apple-darwin ;;
+  Darwin-x86_64) TARGET=x86_64-apple-darwin ;;
+  Linux-x86_64)  TARGET=x86_64-unknown-linux-musl ;;
+  Linux-aarch64) TARGET=aarch64-unknown-linux-musl ;;
+  *) echo "Unsupported platform"; exit 1 ;;
+esac
+
+ARCHIVE="cortex-auth-${VERSION}-${TARGET}"
+curl -fLO "https://github.com/your-org/cortex-auth/releases/download/${VERSION}/${ARCHIVE}.tar.gz"
+tar xzf "${ARCHIVE}.tar.gz"
+sudo mv "${ARCHIVE}/cortex-server" "${ARCHIVE}/cortex-cli" /usr/local/bin/
+rm -rf "${ARCHIVE}" "${ARCHIVE}.tar.gz"
+```
+
+### Manual download
+
+| Platform | Archive |
+|----------|---------|
+| macOS Apple Silicon | `cortex-auth-v0.1.1-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `cortex-auth-v0.1.1-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `cortex-auth-v0.1.1-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 | `cortex-auth-v0.1.1-aarch64-unknown-linux-musl.tar.gz` |
+
+Each archive contains two binaries: `cortex-server` and `cortex-cli`. Extract and place them anywhere on your `PATH`.
+
+### Build from source
+
+```bash
+cargo build --release
+# Binaries at: target/release/cortex-server  target/release/cortex-cli
+```
 
 ## Quick Start
 
@@ -13,7 +58,7 @@ ADMIN_TOKEN=$(openssl rand -hex 16)
 DATABASE_URL=sqlite://cortex-auth.db \
 ENCRYPTION_KEY=$ENCRYPTION_KEY \
 ADMIN_TOKEN=$ADMIN_TOKEN \
-cargo run --bin cortex-server
+cortex-server
 
 # In another terminal — add a secret
 curl -X POST http://localhost:3000/admin/secrets \
@@ -29,7 +74,7 @@ curl -X POST http://localhost:3000/agent/discover \
 # Save the returned project_token!
 
 # Launch your app with secrets injected
-cargo run --bin cortex-cli -- run \
+cortex-cli run \
   --project my-app --token <project_token> --url http://localhost:3000 \
   -- python3 main.py
 ```
