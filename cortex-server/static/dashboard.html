@@ -1,0 +1,879 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CortexAuth — Admin Dashboard</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --sidebar-bg: #1e2536;
+  --sidebar-width: 220px;
+  --accent: #4f8ef7;
+  --accent-hover: #3a7bd5;
+  --danger: #e74c3c;
+  --danger-hover: #c0392b;
+  --success: #2ecc71;
+  --warning: #f39c12;
+  --text: #2d3748;
+  --text-light: #718096;
+  --bg: #f0f2f5;
+  --card-bg: #ffffff;
+  --border: #e2e8f0;
+  --sidebar-text: #a0aec0;
+  --sidebar-text-active: #ffffff;
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+html, body { height: 100%; font-family: var(--font); background: var(--bg); color: var(--text); font-size: 14px; }
+
+/* === Sidebar === */
+.app { display: flex; height: 100vh; }
+
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--sidebar-bg);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+}
+
+.sidebar-header {
+  padding: 20px 16px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.sidebar-logo { font-size: 16px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
+.sidebar-logo span { color: var(--accent); }
+.sidebar-subtitle { font-size: 11px; color: var(--sidebar-text); margin-top: 2px; }
+
+.sidebar-nav { flex: 1; padding: 12px 0; overflow-y: auto; }
+
+.nav-section {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.08em; color: rgba(160,174,192,0.5); padding: 12px 16px 4px;
+}
+
+.nav-item {
+  display: flex; align-items: center; gap: 10px; padding: 9px 16px;
+  cursor: pointer; color: var(--sidebar-text); border-left: 3px solid transparent;
+  transition: all 0.15s; font-size: 13px;
+}
+
+.nav-item:hover { background: rgba(255,255,255,0.05); color: #fff; }
+.nav-item.active { background: rgba(79,142,247,0.15); color: var(--sidebar-text-active); border-left-color: var(--accent); }
+.nav-icon { font-size: 16px; width: 20px; text-align: center; opacity: 0.8; }
+
+.sidebar-footer { padding: 12px 16px; border-top: 1px solid rgba(255,255,255,0.08); }
+.sidebar-token { font-size: 11px; color: var(--sidebar-text); }
+.sidebar-token strong { color: #fff; font-size: 12px; display: block; margin-bottom: 4px; }
+.change-conn { color: var(--accent); cursor: pointer; font-size: 11px; }
+
+/* === Main === */
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+.topbar {
+  background: var(--card-bg); border-bottom: 1px solid var(--border);
+  padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+}
+
+.topbar-title { font-size: 18px; font-weight: 600; }
+.topbar-actions { display: flex; gap: 8px; align-items: center; }
+.content-area { flex: 1; overflow-y: auto; padding: 24px; }
+
+/* === Cards === */
+.card { background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 20px; }
+
+.card-header {
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+.card-title { font-size: 14px; font-weight: 600; }
+.card-body { padding: 20px; }
+
+/* === Tables === */
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th {
+  text-align: left; padding: 10px 12px; font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-light);
+  border-bottom: 1px solid var(--border);
+}
+tbody tr { border-bottom: 1px solid var(--border); transition: background 0.1s; }
+tbody tr:last-child { border-bottom: none; }
+tbody tr:hover { background: #f8fafc; }
+td { padding: 10px 12px; color: var(--text); vertical-align: middle; }
+
+/* === Helpers === */
+.code {
+  font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
+  background: #f1f5f9; padding: 2px 6px; border-radius: 4px;
+}
+
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+.badge-blue   { background: #dbeafe; color: #1d4ed8; }
+.badge-green  { background: #dcfce7; color: #15803d; }
+.badge-orange { background: #fef3c7; color: #92400e; }
+.badge-gray   { background: #f1f5f9; color: #475569; }
+.badge-red    { background: #fee2e2; color: #dc2626; }
+
+.empty-state { text-align: center; padding: 48px 24px; color: var(--text-light); }
+.empty-icon  { font-size: 40px; margin-bottom: 12px; }
+.empty-title { font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+
+/* === Stats === */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.stat-card { background: var(--card-bg); border-radius: 8px; border: 1px solid var(--border); padding: 16px; }
+.stat-label { font-size: 12px; color: var(--text-light); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+.stat-value { font-size: 28px; font-weight: 700; color: var(--text); margin-top: 4px; line-height: 1; }
+.stat-icon  { font-size: 22px; float: right; opacity: 0.3; margin-top: -4px; }
+
+/* === Buttons === */
+.btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px;
+  border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500;
+  transition: all 0.15s; font-family: var(--font); text-decoration: none;
+}
+.btn-primary   { background: var(--accent); color: white; }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-danger    { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+.btn-danger:hover { background: var(--danger); color: white; }
+.btn-secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { background: var(--bg); }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* === Modal === */
+.modal-overlay {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  z-index: 1000; align-items: center; justify-content: center;
+}
+.modal-overlay.open { display: flex; }
+.modal {
+  background: white; border-radius: 10px; width: 520px; max-width: 95vw;
+  max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+}
+.modal-header {
+  padding: 20px 24px 16px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-title { font-size: 16px; font-weight: 600; }
+.modal-close { font-size: 20px; cursor: pointer; color: var(--text-light); border: none; background: none; line-height: 1; }
+.modal-body  { padding: 20px 24px; }
+.modal-footer { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 10px; }
+
+/* === Forms === */
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 6px; }
+.form-group input, .form-group select, .form-group textarea {
+  width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 13px; font-family: var(--font); color: var(--text); background: white; outline: none;
+  transition: border-color 0.15s;
+}
+.form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+  border-color: var(--accent); box-shadow: 0 0 0 3px rgba(79,142,247,0.12);
+}
+.form-group textarea { resize: vertical; min-height: 80px; }
+.form-hint { font-size: 11px; color: var(--text-light); margin-top: 4px; }
+
+/* === Toast === */
+.toast-container { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  padding: 12px 16px; border-radius: 8px; font-size: 13px; font-weight: 500;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.15); animation: slideIn 0.2s ease;
+  max-width: 360px; display: flex; align-items: center; gap: 8px;
+}
+.toast-success { background: #d1fae5; color: #065f46; border-left: 4px solid var(--success); }
+.toast-error   { background: #fee2e2; color: #7f1d1d; border-left: 4px solid var(--danger); }
+.toast-info    { background: #dbeafe; color: #1e3a5f; border-left: 4px solid var(--accent); }
+@keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+/* === Setup Screen === */
+.setup-screen { display: flex; align-items: center; justify-content: center; height: 100vh; background: var(--bg); }
+.setup-card {
+  background: white; border-radius: 12px; border: 1px solid var(--border);
+  padding: 40px; width: 400px; box-shadow: 0 8px 32px rgba(0,0,0,0.08);
+}
+.setup-logo { font-size: 22px; font-weight: 800; margin-bottom: 8px; }
+.setup-logo span { color: var(--accent); }
+.setup-subtitle { color: var(--text-light); font-size: 14px; margin-bottom: 28px; }
+
+/* === Misc === */
+.secret-value-box { display: flex; align-items: center; gap: 8px; }
+.secret-value-text {
+  font-family: 'SF Mono', monospace; font-size: 12px; background: #f1f5f9;
+  padding: 6px 10px; border-radius: 4px; flex: 1; word-break: break-all;
+}
+.warning-box {
+  background: #fef3c7; border: 1px solid #fcd34d; border-radius: 6px;
+  padding: 12px 16px; font-size: 13px; color: #92400e;
+  margin-bottom: 16px; display: flex; gap: 10px;
+}
+.log-success { color: var(--success); font-weight: 600; }
+.log-failure { color: var(--danger); font-weight: 600; }
+
+section { display: none; }
+section.active { display: block; }
+
+.loading { text-align: center; padding: 40px; color: var(--text-light); }
+.spinner {
+  width: 28px; height: 28px; border: 3px solid #e2e8f0; border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.7s linear infinite; margin: 0 auto 12px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.table-wrap { overflow-x: auto; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e0; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Setup Screen -->
+<div id="setup-screen" class="setup-screen">
+  <div class="setup-card">
+    <div class="setup-logo">Cortex<span>Auth</span></div>
+    <div class="setup-subtitle">Enter your admin token and server URL to connect.</div>
+    <div class="form-group">
+      <label>Server URL</label>
+      <input type="text" id="setup-url" value="http://localhost:3000" placeholder="http://localhost:3000">
+    </div>
+    <div class="form-group">
+      <label>Admin Token</label>
+      <input type="password" id="setup-token" placeholder="your-admin-token"
+        onkeydown="if(event.key==='Enter') App.connect()">
+    </div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center" onclick="App.connect()">Connect →</button>
+  </div>
+</div>
+
+<!-- Toasts -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- Main App -->
+<div id="app" class="app" style="display:none">
+  <nav class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">🔐 Cortex<span>Auth</span></div>
+      <div class="sidebar-subtitle">Admin Dashboard</div>
+    </div>
+    <div class="sidebar-nav">
+      <div class="nav-section">Management</div>
+      <div class="nav-item" data-section="secrets" onclick="App.nav('secrets')">
+        <span class="nav-icon">🔑</span> Secrets
+      </div>
+      <div class="nav-item" data-section="agents" onclick="App.nav('agents')">
+        <span class="nav-icon">🤖</span> Agents
+      </div>
+      <div class="nav-item" data-section="policies" onclick="App.nav('policies')">
+        <span class="nav-icon">📋</span> Policies
+      </div>
+      <div class="nav-section">Monitoring</div>
+      <div class="nav-item" data-section="projects" onclick="App.nav('projects')">
+        <span class="nav-icon">📁</span> Projects
+      </div>
+      <div class="nav-item" data-section="audit" onclick="App.nav('audit')">
+        <span class="nav-icon">📜</span> Audit Logs
+      </div>
+      <div class="nav-section">Operations</div>
+      <div class="nav-item" data-section="rotate" onclick="App.nav('rotate')">
+        <span class="nav-icon">🔄</span> Key Rotation
+      </div>
+    </div>
+    <div class="sidebar-footer">
+      <div class="sidebar-token">
+        <strong id="footer-url"></strong>
+        <span class="change-conn" onclick="App.disconnect()">⬆ Change connection</span>
+      </div>
+    </div>
+  </nav>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-title" id="page-title">Secrets</div>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </div>
+    <div class="content-area">
+
+      <!-- Secrets -->
+      <section id="sec-secrets">
+        <div id="secrets-stats" class="stats-grid"></div>
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">All Secrets</span>
+            <input type="text" id="secrets-search" placeholder="Filter by key path…"
+              style="padding:5px 10px;border:1px solid var(--border);border-radius:5px;font-size:12px;width:200px"
+              oninput="Secrets.filter(this.value)">
+          </div>
+          <div class="table-wrap" id="secrets-table"></div>
+        </div>
+      </section>
+
+      <!-- Agents -->
+      <section id="sec-agents">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Registered Agents</span></div>
+          <div class="table-wrap" id="agents-table"></div>
+        </div>
+      </section>
+
+      <!-- Policies -->
+      <section id="sec-policies">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Access Policies</span></div>
+          <div class="table-wrap" id="policies-table"></div>
+        </div>
+      </section>
+
+      <!-- Projects -->
+      <section id="sec-projects">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Registered Projects</span></div>
+          <div class="table-wrap" id="projects-table"></div>
+        </div>
+      </section>
+
+      <!-- Audit Logs -->
+      <section id="sec-audit">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title">Audit Log (last 1000)</span>
+            <input type="text" id="audit-search" placeholder="Filter by agent / action…"
+              style="padding:5px 10px;border:1px solid var(--border);border-radius:5px;font-size:12px;width:220px"
+              oninput="Audit.filter(this.value)">
+          </div>
+          <div class="table-wrap" id="audit-table"></div>
+        </div>
+      </section>
+
+      <!-- Key Rotation -->
+      <section id="sec-rotate">
+        <div class="card" style="max-width:560px">
+          <div class="card-header"><span class="card-title">Encryption Key Rotation</span></div>
+          <div class="card-body">
+            <div class="warning-box">
+              ⚠️
+              <div>After rotation, you <strong>must</strong> update the
+                <code>ENCRYPTION_KEY</code> environment variable and restart the server.
+                All secrets will be re-encrypted with the new key.</div>
+            </div>
+            <div class="form-group">
+              <label>New Encryption Key (64 hex chars = 32 bytes)</label>
+              <div style="display:flex;gap:8px">
+                <input type="text" id="rotate-input" placeholder="64 hex characters"
+                  style="font-family:monospace;flex:1" oninput="RotateKey.preview()">
+                <button class="btn btn-secondary" onclick="RotateKey.generate()">Generate</button>
+              </div>
+              <div class="form-hint">Run <code>openssl rand -hex 32</code> or click Generate.</div>
+            </div>
+            <div id="rotate-preview" style="display:none;margin-bottom:16px">
+              <div style="font-size:12px;font-weight:600;margin-bottom:4px;color:var(--text-light)">
+                Copy this key before rotating — it cannot be recovered:
+              </div>
+              <div id="rotate-preview-text" class="code" style="padding:8px 10px;word-break:break-all;font-size:12px;cursor:pointer"
+                onclick="copyText(this.textContent,'Key copied!')"></div>
+            </div>
+            <button class="btn btn-danger" id="rotate-btn" onclick="RotateKey.confirm()">
+              🔄 Rotate Encryption Key
+            </button>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modal-title"></span>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const S = { url: '', token: '', secrets: [], auditLogs: [] };
+
+// ── API ────────────────────────────────────────────────────────────────────
+const API = {
+  async req(method, path, body) {
+    const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Admin-Token': S.token } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const res = await fetch(S.url + path, opts);
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      throw new Error(j.error || j.message || res.statusText);
+    }
+    if (res.status === 204) return null;
+    return res.json();
+  },
+  get: (p)    => API.req('GET',    p),
+  post: (p,b) => API.req('POST',   p, b),
+  put: (p,b)  => API.req('PUT',    p, b),
+  del: (p)    => API.req('DELETE', p),
+};
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, type = 'info') {
+  const icons = { success: '✓', error: '✗', info: 'ℹ' };
+  const el = document.createElement('div');
+  el.className = `toast toast-${type}`;
+  el.innerHTML = `<span>${icons[type]||'•'}</span><span>${esc(msg)}</span>`;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 4500);
+}
+
+// ── Modal ──────────────────────────────────────────────────────────────────
+function openModal(title, body, footer) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-body').innerHTML = body;
+  document.getElementById('modal-footer').innerHTML = footer;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+function closeModal() { document.getElementById('modal-overlay').classList.remove('open'); }
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtDate(s) { try { return s ? new Date(s).toLocaleString() : '—'; } catch { return s||'—'; } }
+function typeBadge(t) {
+  const cls = { KEY_VALUE:'badge-blue', JSON_CONFIG:'badge-orange', TEMPLATE_CONFIG:'badge-green' };
+  return `<span class="badge ${cls[t]||'badge-gray'}">${esc(t)}</span>`;
+}
+function loadHTML() { return '<div class="loading"><div class="spinner"></div>Loading…</div>'; }
+function emptyHTML(icon, title, sub) {
+  return `<div class="empty-state"><div class="empty-icon">${icon}</div><div class="empty-title">${title}</div>${sub}</div>`;
+}
+function copyText(text, msg) {
+  navigator.clipboard.writeText(text).then(() => toast(msg || 'Copied!', 'success'));
+}
+function randHex32() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(32))).map(b => b.toString(16).padStart(2,'0')).join('');
+}
+
+// ── App ────────────────────────────────────────────────────────────────────
+const App = {
+  connect() {
+    const url = document.getElementById('setup-url').value.trim().replace(/\/$/, '');
+    const token = document.getElementById('setup-token').value.trim();
+    if (!url || !token) { toast('URL and token are required', 'error'); return; }
+    S.url = url; S.token = token;
+    document.getElementById('footer-url').textContent = url.replace(/^https?:\/\//, '');
+    document.getElementById('setup-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    App.nav('secrets');
+  },
+  disconnect() {
+    S.url = ''; S.token = '';
+    document.getElementById('app').style.display = 'none';
+    document.getElementById('setup-screen').style.display = 'flex';
+    document.getElementById('setup-token').value = '';
+  },
+  nav(sec) {
+    const titles   = { secrets:'Secrets', agents:'Agents', policies:'Policies', projects:'Projects', audit:'Audit Logs', rotate:'Key Rotation' };
+    const actions  = {
+      secrets:  `<button class="btn btn-primary" onclick="Secrets.openCreate()">+ Add Secret</button><button class="btn btn-secondary" onclick="Secrets.load()">↻</button>`,
+      agents:   `<button class="btn btn-primary" onclick="Agents.openCreate()">+ Register Agent</button><button class="btn btn-secondary" onclick="Agents.load()">↻</button>`,
+      policies: `<button class="btn btn-primary" onclick="Policies.openCreate()">+ Create Policy</button><button class="btn btn-secondary" onclick="Policies.load()">↻</button>`,
+      projects: `<button class="btn btn-secondary" onclick="Projects.load()">↻ Refresh</button>`,
+      audit:    `<button class="btn btn-secondary" onclick="Audit.load()">↻ Refresh</button>`,
+      rotate:   '',
+    };
+    const loaders  = { secrets: Secrets.load, agents: Agents.load, policies: Policies.load, projects: Projects.load, audit: Audit.load };
+    document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.section === sec));
+    document.getElementById('page-title').textContent = titles[sec] || sec;
+    document.getElementById('topbar-actions').innerHTML = actions[sec] || '';
+    document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
+    document.getElementById('sec-' + sec).classList.add('active');
+    if (loaders[sec]) loaders[sec]();
+  },
+};
+
+// ── Secrets ────────────────────────────────────────────────────────────────
+const Secrets = {
+  async load() {
+    const el = document.getElementById('secrets-table');
+    el.innerHTML = loadHTML();
+    try {
+      S.secrets = await API.get('/admin/secrets');
+      Secrets.renderStats(S.secrets);
+      Secrets.render(S.secrets);
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed to load secrets: ' + e.message, 'error');
+    }
+  },
+
+  renderStats(rows) {
+    const counts = { KEY_VALUE: 0, JSON_CONFIG: 0, TEMPLATE_CONFIG: 0 };
+    const ns = new Set();
+    rows.forEach(r => { counts[r.secret_type]++; ns.add(r.namespace || 'default'); });
+    document.getElementById('secrets-stats').innerHTML = `
+      <div class="stat-card"><span class="stat-icon">🔑</span><div class="stat-label">Total</div><div class="stat-value">${rows.length}</div></div>
+      <div class="stat-card"><span class="stat-icon">⚙️</span><div class="stat-label">Key/Value</div><div class="stat-value">${counts.KEY_VALUE}</div></div>
+      <div class="stat-card"><span class="stat-icon">📄</span><div class="stat-label">JSON Config</div><div class="stat-value">${counts.JSON_CONFIG}</div></div>
+      <div class="stat-card"><span class="stat-icon">📝</span><div class="stat-label">Templates</div><div class="stat-value">${counts.TEMPLATE_CONFIG}</div></div>
+      <div class="stat-card"><span class="stat-icon">🏷️</span><div class="stat-label">Namespaces</div><div class="stat-value">${ns.size}</div></div>`;
+  },
+
+  render(rows) {
+    const el = document.getElementById('secrets-table');
+    if (!rows.length) { el.innerHTML = emptyHTML('🔑', 'No secrets yet', 'Click "+ Add Secret" to store your first secret.'); return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>Key Path</th><th>Type</th><th>Namespace</th><th>Description</th><th>Updated</th><th>Actions</th></tr></thead>
+      <tbody>${rows.map(s => `<tr>
+        <td><span class="code">${esc(s.key_path)}</span></td>
+        <td>${typeBadge(s.secret_type)}</td>
+        <td><span class="badge badge-gray">${esc(s.namespace||'default')}</span></td>
+        <td style="color:var(--text-light)">${esc(s.description||'—')}</td>
+        <td style="color:var(--text-light);font-size:12px">${fmtDate(s.updated_at||s.created_at)}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-secondary btn-sm" onclick='Secrets.view(${JSON.stringify(s.id)},${JSON.stringify(s.key_path)})'>👁 View</button>
+          <button class="btn btn-secondary btn-sm" onclick='Secrets.openEdit(${JSON.stringify(s.id)},${JSON.stringify(s.key_path)},${JSON.stringify(s.description||"")})'>✎</button>
+          <button class="btn btn-danger btn-sm"    onclick='Secrets.del(${JSON.stringify(s.id)},${JSON.stringify(s.key_path)})'>🗑</button>
+        </td>
+      </tr>`).join('')}</tbody></table>`;
+  },
+
+  filter(q) {
+    const r = q ? S.secrets.filter(s => s.key_path.toLowerCase().includes(q.toLowerCase())) : S.secrets;
+    Secrets.render(r);
+  },
+
+  async view(id, path) {
+    openModal(`Secret: ${path}`, loadHTML(), '');
+    try {
+      const s = await API.get(`/admin/secrets/${id}`);
+      document.getElementById('modal-body').innerHTML = `
+        <div class="form-group"><label>Key Path</label><div class="code" style="padding:8px">${esc(s.key_path)}</div></div>
+        <div class="form-group"><label>Type</label>${typeBadge(s.secret_type)}</div>
+        <div class="form-group"><label>Namespace</label><span class="badge badge-gray">${esc(s.namespace||'default')}</span></div>
+        ${s.description ? `<div class="form-group"><label>Description</label><div style="color:var(--text-light)">${esc(s.description)}</div></div>` : ''}
+        <div class="form-group"><label>Value <small style="color:var(--text-light)">(click to copy)</small></label>
+          <div class="secret-value-box">
+            <div class="secret-value-text" id="sv-val" onclick="copyText(this.textContent,'Value copied!')" style="cursor:pointer" title="Click to copy">${esc(s.value)}</div>
+            <button class="btn btn-secondary btn-sm" onclick="copyText(document.getElementById('sv-val').textContent,'Copied!')">Copy</button>
+          </div>
+        </div>
+        <div style="font-size:12px;color:var(--text-light)">Updated: ${fmtDate(s.updated_at)}</div>`;
+      document.getElementById('modal-footer').innerHTML = `<button class="btn btn-secondary" onclick="closeModal()">Close</button>`;
+    } catch(e) {
+      document.getElementById('modal-body').innerHTML = `<p style="color:var(--danger)">${esc(e.message)}</p>`;
+    }
+  },
+
+  openCreate() {
+    openModal('Add Secret',
+      `<div class="form-group"><label>Key Path *</label><input id="f-kp" type="text" placeholder="e.g. openai_api_key"></div>
+       <div class="form-group"><label>Type</label>
+         <select id="f-ty"><option>KEY_VALUE</option><option>JSON_CONFIG</option><option>TEMPLATE_CONFIG</option></select>
+       </div>
+       <div class="form-group"><label>Value *</label><textarea id="f-val" placeholder="Secret value…"></textarea></div>
+       <div class="form-group"><label>Namespace</label><input id="f-ns" type="text" placeholder="default"><div class="form-hint">Leave blank for "default"</div></div>
+       <div class="form-group"><label>Description</label><input id="f-dc" type="text" placeholder="Optional"></div>`,
+      `<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-primary" onclick="Secrets.create()">Create Secret</button>`);
+  },
+
+  async create() {
+    const kp = document.getElementById('f-kp').value.trim();
+    const val = document.getElementById('f-val').value;
+    const ty  = document.getElementById('f-ty').value;
+    const ns  = document.getElementById('f-ns').value.trim() || undefined;
+    const dc  = document.getElementById('f-dc').value.trim() || undefined;
+    if (!kp || !val) { toast('Key path and value are required', 'error'); return; }
+    try {
+      await API.post('/admin/secrets', { key_path: kp, secret_type: ty, value: val, namespace: ns, description: dc });
+      closeModal(); toast(`Secret "${kp}" created`, 'success'); Secrets.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+
+  openEdit(id, path, desc) {
+    openModal(`Edit: ${path}`,
+      `<div class="form-group"><label>New Value</label>
+         <textarea id="fe-val" placeholder="Leave blank to keep existing value"></textarea>
+         <div class="form-hint">Leave blank to keep the existing value.</div>
+       </div>
+       <div class="form-group"><label>Description</label>
+         <input id="fe-dc" type="text" value="${esc(desc)}" placeholder="Description"></div>`,
+      `<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-primary" onclick="Secrets.update('${esc(id)}')">Save</button>`);
+  },
+
+  async update(id) {
+    const val = document.getElementById('fe-val').value || undefined;
+    const dc  = document.getElementById('fe-dc').value.trim() || undefined;
+    try {
+      await API.put(`/admin/secrets/${id}`, { value: val, description: dc });
+      closeModal(); toast('Secret updated', 'success'); Secrets.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+
+  async del(id, path) {
+    if (!confirm(`Delete secret "${path}"? This cannot be undone.`)) return;
+    try {
+      await API.del(`/admin/secrets/${id}`);
+      toast(`Secret "${path}" deleted`, 'success'); Secrets.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+};
+
+// ── Agents ─────────────────────────────────────────────────────────────────
+const Agents = {
+  async load() {
+    const el = document.getElementById('agents-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/agents');
+      if (!rows.length) { el.innerHTML = emptyHTML('🤖', 'No agents registered', 'Click "+ Register Agent" to add one.'); return; }
+      el.innerHTML = `<table>
+        <thead><tr><th>Agent ID</th><th>Namespace</th><th>Description</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>${rows.map(a => `<tr>
+          <td><span class="code">${esc(a.agent_id)}</span></td>
+          <td><span class="badge badge-gray">${esc(a.namespace||'default')}</span></td>
+          <td style="color:var(--text-light)">${esc(a.description||'—')}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(a.created_at)}</td>
+          <td><button class="btn btn-danger btn-sm" onclick='Agents.del(${JSON.stringify(a.agent_id)})'>🗑 Delete</button></td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  openCreate() {
+    openModal('Register Agent',
+      `<div class="form-group"><label>Agent ID *</label>
+         <input id="fa-id" type="text" placeholder="e.g. pipeline-agent-prod">
+         <div class="form-hint">Unique identifier used in JWT authentication.</div>
+       </div>
+       <div class="form-group"><label>JWT Secret *</label>
+         <div style="display:flex;gap:8px">
+           <input id="fa-sec" type="text" placeholder="hex or text secret" style="flex:1;font-family:monospace">
+           <button class="btn btn-secondary btn-sm" onclick="document.getElementById('fa-sec').value=randHex32()">Gen</button>
+         </div>
+         <div class="form-hint">Agent uses this to sign its auth JWT.</div>
+       </div>
+       <div class="form-group"><label>Namespace</label><input id="fa-ns" type="text" placeholder="default"></div>
+       <div class="form-group"><label>Description</label><input id="fa-dc" type="text" placeholder="Optional"></div>`,
+      `<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-primary" onclick="Agents.create()">Register</button>`);
+  },
+
+  async create() {
+    const id  = document.getElementById('fa-id').value.trim();
+    const sec = document.getElementById('fa-sec').value.trim();
+    const ns  = document.getElementById('fa-ns').value.trim() || undefined;
+    const dc  = document.getElementById('fa-dc').value.trim() || undefined;
+    if (!id || !sec) { toast('Agent ID and JWT secret are required', 'error'); return; }
+    try {
+      await API.post('/admin/agents', { agent_id: id, jwt_secret: sec, namespace: ns, description: dc });
+      closeModal(); toast(`Agent "${id}" registered`, 'success'); Agents.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+
+  async del(agentId) {
+    if (!confirm(`Delete agent "${agentId}"?`)) return;
+    try {
+      await API.del(`/admin/agents/${agentId}`);
+      toast(`Agent "${agentId}" deleted`, 'success'); Agents.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+};
+
+// ── Policies ───────────────────────────────────────────────────────────────
+const Policies = {
+  async load() {
+    const el = document.getElementById('policies-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/policies');
+      if (!rows.length) { el.innerHTML = emptyHTML('📋', 'No policies', 'Policies control which agents can access which secrets.'); return; }
+      el.innerHTML = `<table>
+        <thead><tr><th>Name</th><th>Agent Pattern</th><th>Allowed Paths</th><th>Denied Paths</th><th>Created</th><th>Actions</th></tr></thead>
+        <tbody>${rows.map(p => `<tr>
+          <td><strong>${esc(p.policy_name)}</strong></td>
+          <td><span class="code">${esc(p.agent_pattern)}</span></td>
+          <td>${(p.allowed_paths||[]).map(x=>`<span class="badge badge-green">${esc(x)}</span>`).join(' ')||'<span style="color:var(--text-light)">all</span>'}</td>
+          <td>${(p.denied_paths||[]).map(x=>`<span class="badge badge-red">${esc(x)}</span>`).join(' ')||'<span style="color:var(--text-light)">none</span>'}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(p.created_at)}</td>
+          <td><button class="btn btn-danger btn-sm" onclick='Policies.del(${JSON.stringify(p.id)},${JSON.stringify(p.policy_name)})'>🗑</button></td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  openCreate() {
+    openModal('Create Policy',
+      `<div class="form-group"><label>Policy Name *</label><input id="fp-nm" type="text" placeholder="e.g. prod-readonly"></div>
+       <div class="form-group"><label>Agent Pattern *</label>
+         <input id="fp-ag" type="text" placeholder="prod-* or specific-agent-id">
+         <div class="form-hint">Use <code>*</code> for all, <code>prefix-*</code> for wildcard.</div>
+       </div>
+       <div class="form-group"><label>Allowed Paths</label>
+         <input id="fp-al" type="text" placeholder="openai_api_key, db/* (comma-separated)">
+         <div class="form-hint">Leave blank to allow all (subject to denied list).</div>
+       </div>
+       <div class="form-group"><label>Denied Paths</label>
+         <input id="fp-dn" type="text" placeholder="admin_key, internal/* (comma-separated)">
+       </div>`,
+      `<button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-primary" onclick="Policies.create()">Create</button>`);
+  },
+
+  async create() {
+    const name = document.getElementById('fp-nm').value.trim();
+    const ag   = document.getElementById('fp-ag').value.trim();
+    const al   = document.getElementById('fp-al').value.trim();
+    const dn   = document.getElementById('fp-dn').value.trim();
+    if (!name || !ag) { toast('Name and agent pattern required', 'error'); return; }
+    const allowed = al ? al.split(',').map(s=>s.trim()).filter(Boolean) : [];
+    const denied  = dn ? dn.split(',').map(s=>s.trim()).filter(Boolean) : [];
+    try {
+      await API.post('/admin/policies', { policy_name: name, agent_pattern: ag, allowed_paths: allowed, denied_paths: denied });
+      closeModal(); toast(`Policy "${name}" created`, 'success'); Policies.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+
+  async del(id, name) {
+    if (!confirm(`Delete policy "${name}"?`)) return;
+    try {
+      await API.del(`/admin/policies/${id}`);
+      toast(`Policy "${name}" deleted`, 'success'); Policies.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+};
+
+// ── Projects ───────────────────────────────────────────────────────────────
+const Projects = {
+  async load() {
+    const el = document.getElementById('projects-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/projects');
+      if (!rows.length) { el.innerHTML = emptyHTML('📁', 'No projects', 'Projects are registered via the /agent/discover endpoint.'); return; }
+      el.innerHTML = `<table>
+        <thead><tr><th>Project Name</th><th>Namespace</th><th>Env Mappings</th><th>Created</th></tr></thead>
+        <tbody>${rows.map(p => {
+          const m = p.env_mappings || {};
+          const n = Object.keys(m).length;
+          const viewBtn = n ? `<button class="btn btn-secondary btn-sm" style="margin-left:6px"
+            onclick='Projects.showMappings(${JSON.stringify(JSON.stringify(m))},${JSON.stringify(p.project_name)})'>View</button>` : '';
+          return `<tr>
+            <td><strong>${esc(p.project_name)}</strong></td>
+            <td><span class="badge badge-gray">${esc(p.namespace||'default')}</span></td>
+            <td><span class="badge badge-blue">${n} mapping${n!==1?'s':''}</span>${viewBtn}</td>
+            <td style="color:var(--text-light);font-size:12px">${fmtDate(p.created_at)}</td>
+          </tr>`;
+        }).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  showMappings(json, name) {
+    const m = JSON.parse(json);
+    const rows = Object.entries(m).map(([k,v]) =>
+      `<tr><td><span class="code">${esc(k)}</span></td><td style="color:var(--text-light)">→</td><td><span class="code">${esc(v)}</span></td></tr>`
+    ).join('');
+    openModal(`${name} — Env Mappings`,
+      `<table><thead><tr><th>ENV Variable</th><th></th><th>Secret Path</th></tr></thead><tbody>${rows}</tbody></table>`,
+      `<button class="btn btn-secondary" onclick="closeModal()">Close</button>`);
+  },
+};
+
+// ── Audit Logs ─────────────────────────────────────────────────────────────
+const Audit = {
+  async load() {
+    const el = document.getElementById('audit-table');
+    el.innerHTML = loadHTML();
+    try {
+      S.auditLogs = await API.get('/admin/audit-logs');
+      Audit.render(S.auditLogs);
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed: ' + e.message, 'error');
+    }
+  },
+
+  render(rows) {
+    const el = document.getElementById('audit-table');
+    if (!rows.length) { el.innerHTML = emptyHTML('📜', 'No audit logs', 'All operations are logged here.'); return; }
+    el.innerHTML = `<table>
+      <thead><tr><th>Timestamp</th><th>Agent</th><th>Project</th><th>Action</th><th>Resource</th><th>Status</th></tr></thead>
+      <tbody>${rows.map(l => `<tr>
+        <td style="font-size:12px;color:var(--text-light);white-space:nowrap">${fmtDate(l.timestamp)}</td>
+        <td><span class="code">${esc(l.agent_id||'—')}</span></td>
+        <td style="color:var(--text-light)">${esc(l.project_name||'—')}</td>
+        <td><span class="badge badge-blue">${esc(l.action)}</span></td>
+        <td style="color:var(--text-light);font-size:12px">${esc(l.resource_path||'—')}</td>
+        <td class="log-${l.status==='success'?'success':'failure'}">${esc(l.status)}</td>
+      </tr>`).join('')}</tbody></table>`;
+  },
+
+  filter(q) {
+    if (!q) { Audit.render(S.auditLogs); return; }
+    const lq = q.toLowerCase();
+    Audit.render(S.auditLogs.filter(l =>
+      (l.agent_id||'').toLowerCase().includes(lq) ||
+      (l.action||'').toLowerCase().includes(lq) ||
+      (l.project_name||'').toLowerCase().includes(lq) ||
+      (l.resource_path||'').toLowerCase().includes(lq)
+    ));
+  },
+};
+
+// ── Key Rotation ───────────────────────────────────────────────────────────
+const RotateKey = {
+  generate() {
+    const key = randHex32();
+    document.getElementById('rotate-input').value = key;
+    RotateKey.preview();
+  },
+  preview() {
+    const key = document.getElementById('rotate-input').value.trim();
+    const pv  = document.getElementById('rotate-preview');
+    if (key.length === 64) {
+      document.getElementById('rotate-preview-text').textContent = key;
+      pv.style.display = 'block';
+    } else {
+      pv.style.display = 'none';
+    }
+  },
+  confirm() {
+    const key = document.getElementById('rotate-input').value.trim();
+    if (!key)         { toast('Enter or generate a new key first', 'error'); return; }
+    if (key.length !== 64) { toast('Key must be exactly 64 hex characters', 'error'); return; }
+    if (!confirm('This will re-encrypt ALL secrets and agent credentials. You must update ENCRYPTION_KEY and restart the server after this operation.\n\nHave you saved the new key? Continue?')) return;
+    RotateKey.execute(key);
+  },
+  async execute(key) {
+    const btn = document.getElementById('rotate-btn');
+    btn.disabled = true; btn.textContent = '⏳ Rotating…';
+    try {
+      const r = await API.post('/admin/rotate-key', { new_encryption_key: key });
+      toast(`✓ Key rotated — ${r.secrets_updated} secrets, ${r.agents_updated} agents re-encrypted. Restart the server!`, 'success');
+      document.getElementById('rotate-input').value = '';
+      document.getElementById('rotate-preview').style.display = 'none';
+    } catch(e) {
+      toast('Rotation failed: ' + e.message, 'error');
+    }
+    btn.disabled = false; btn.textContent = '🔄 Rotate Encryption Key';
+  },
+};
+</script>
+</body>
+</html>

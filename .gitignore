@@ -1,0 +1,55 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+api/target/
+web/.next
+web/node_modules
+target/
+
+# Environment files
+.env
+.env.local
+
+# Data and logs
+logs/
+*.log
+*.db
+celerybeat-schedule*
+dump.rdb
+.omc/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Java
+gateway/target/
+*.class
+*.jar
+
+# Node.js
+node_modules/
+.next/
+.turbo/
+
+# OS
+.DS_Store
+Thumbs.db
+# Sandbox temp files
+tmp/
+
+.qoder
+.vscode
+
+cheetsheet.sh
+.gstack/

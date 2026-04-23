@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "cortex-server",
+    "cortex-cli",
+]
+resolver = "2"
