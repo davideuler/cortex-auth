@@ -239,7 +239,7 @@ section.active { display: block; }
     <div class="setup-subtitle">Enter your admin token and server URL to connect.</div>
     <div class="form-group">
       <label>Server URL</label>
-      <input type="text" id="setup-url" value="http://localhost:3000" placeholder="http://localhost:3000">
+      <input type="text" id="setup-url" placeholder="http://localhost:3000">
     </div>
     <div class="form-group">
       <label>Admin Token</label>
@@ -402,6 +402,8 @@ section.active { display: block; }
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 const S = { url: '', token: '', secrets: [], auditLogs: [] };
+
+document.getElementById('setup-url').value = window.location.origin;
 
 // ── API ────────────────────────────────────────────────────────────────────
 const API = {
