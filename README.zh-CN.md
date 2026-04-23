@@ -4,6 +4,56 @@
 
 一个轻量级的 Rust 密钥保险库，专为 AI Agent 和自动化流水线设计。安全地存储 API Key 和配置，在运行时自动发现并注入项目所需的密钥——无需在源代码中硬编码任何敏感信息。
 
+## 架构
+
+```
+                      ┌──────────────────────────────────────┐
+                      │           cortex-server              │
+         管理员 API    │  · 存储密钥（AES-256-GCM 加密）      │
+  管理员 ────────────►│  · 验证 Agent 身份（JWT）             │
+  (curl / API)        │  · 签发项目令牌                       │
+                      └───────────────┬──────────────────────┘
+                                      │  ② project_token
+                                      │  ③ env vars 环境变量
+                                      │
+  ┌───────────────────────────────────┼────────────────────────┐
+  │               Agent               │                        │
+  │         （自主运行的 AI 流水线）    │                        │
+  │                                   ▼                        │
+  │  ① cortex-cli gen-token  ┌─────────────────┐              │
+  │  ──────────────────────► │   cortex-cli    │              │
+  │                          │                 │              │
+  │  ④ cortex-cli run        │  gen-token      │              │
+  │  ──────────────────────► │  run → exec()   │              │
+  └──────────────────────────┴────────┬────────┘──────────────┘
+                                      │
+                                 exec() 注入环境变量
+                                      │
+                                      ▼
+                            ┌─────────────────────┐
+                            │    项目进程           │
+                            │  python main.py     │
+                            │  node app.js  …     │
+                            │                     │
+                            │  OPENAI_API_KEY=...  │
+                            │  DB_PASSWORD=...    │
+                            │  AUTH_TOKEN=...     │
+                            └─────────────────────┘
+```
+
+**执行流程：**
+1. **管理员** 通过 admin API 将项目密钥预存至 `cortex-server`
+2. **Agent** 调用 `cortex-cli gen-token` 签名 JWT（`auth_proof`）以证明身份
+3. **Agent** 将 `auth_proof` POST 到 `/agent/discover` → 获取 `project_token`
+4. **Agent** 调用 `cortex-cli run --project <name> --token <project_token>`，从服务器拉取密钥并通过 `exec()` 将其注入为环境变量后启动目标进程
+
+## Agent 密钥管理原则
+
+- **Agent 不接触密钥明文** — 密钥由 `cortex-server` 直接通过 `exec()` 注入进程环境，Agent 代码本身从不读取或存储密钥值
+- **无需人工介入** — Agent 自主完成跨项目、跨任务的密钥获取与注入，每次运行无需人工手动输入凭证
+- **全自动密钥注入** — 无人值守的 Agent 流水线在运行时按需获取所需密钥，无需操作人员介入
+- **密钥不落盘** — API Key、数据库密码、Auth Token、密码等凭证仅以环境变量形式存在于进程内存中，不写入任何文件
+
 ## 安装
 
 ### Homebrew（macOS Apple Silicon）

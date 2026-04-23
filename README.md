@@ -4,6 +4,56 @@
 
 A lightweight, Rust-based secrets vault designed for AI agents and automated pipelines. Store API keys and configuration securely, discover which secrets your project needs, and inject them at runtime — without ever hardcoding secrets in source code.
 
+## Architecture
+
+```
+                      ┌──────────────────────────────────────┐
+                      │           cortex-server              │
+         admin API    │  · stores secrets  (AES-256-GCM)     │
+  Admin ─────────────►│  · authenticates agents  (JWT)       │
+  (curl / API)        │  · issues project tokens             │
+                      └───────────────┬──────────────────────┘
+                                      │  ② project_token
+                                      │  ③ env vars
+                                      │
+  ┌───────────────────────────────────┼────────────────────────┐
+  │                Agent              │                        │
+  │         (autonomous pipeline)     │                        │
+  │                                   ▼                        │
+  │  ① cortex-cli gen-token  ┌─────────────────┐              │
+  │  ──────────────────────► │   cortex-cli    │              │
+  │                          │                 │              │
+  │  ④ cortex-cli run        │  gen-token      │              │
+  │  ──────────────────────► │  run → exec()   │              │
+  └──────────────────────────┴────────┬────────┘──────────────┘
+                                      │
+                                 exec() with env vars injected
+                                      │
+                                      ▼
+                            ┌─────────────────────┐
+                            │   Project Process   │
+                            │  python main.py     │
+                            │  node app.js  …     │
+                            │                     │
+                            │  OPENAI_API_KEY=...  │
+                            │  DB_PASSWORD=...    │
+                            │  AUTH_TOKEN=...     │
+                            └─────────────────────┘
+```
+
+**Flow:**
+1. **Admin** pre-loads project secrets into `cortex-server` via the admin API
+2. **Agent** calls `cortex-cli gen-token` to sign a JWT (`auth_proof`) proving its identity
+3. **Agent** posts `auth_proof` to `/agent/discover` → receives a `project_token`
+4. **Agent** calls `cortex-cli run --project <name> --token <project_token>` which fetches secrets from the server and `exec()`s the target process with them injected as environment variables
+
+## Agent Key Management Principles
+
+- **Agents never touch secret values** — secrets flow directly from `cortex-server` into the process environment via `exec()`; agent code never reads or stores them
+- **No human intervention per task** — agents autonomously obtain and inject secrets across any number of projects and tasks without requiring manual input for each run
+- **Fully autonomous secret injection** — unattended agent pipelines retrieve all required credentials on demand at runtime; no operator in the loop
+- **Secrets never written to disk** — API keys, database credentials, tokens, and passwords exist only in process memory as environment variables; nothing is persisted to files
+
 ## Installation
 
 ### Homebrew (macOS Apple Silicon)
