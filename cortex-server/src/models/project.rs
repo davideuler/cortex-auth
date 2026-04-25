@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Default project token lifetime in minutes (120 minutes = 2 hours).
+pub const DEFAULT_TOKEN_TTL_MINUTES: i64 = 120;
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Project {
     pub id: String,
@@ -10,6 +13,8 @@ pub struct Project {
     pub namespace: String,
     pub created_at: String,
     pub updated_at: String,
+    pub token_expires_at: Option<String>,
+    pub token_revoked_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +36,8 @@ pub struct DiscoverResponse {
     pub mapped_keys: HashMap<String, String>,
     pub full_matched: bool,
     pub project_token: String,
+    pub token_expires_at: String,
+    pub token_ttl_seconds: i64,
     pub unmatched_keys: Vec<String>,
     pub namespace: String,
 }
@@ -47,11 +54,30 @@ pub struct ProjectListItem {
     pub env_mappings: HashMap<String, String>,
     pub namespace: String,
     pub created_at: String,
+    pub token_expires_at: Option<String>,
+    pub token_revoked_at: Option<String>,
+    pub token_status: String,
 }
 
 impl Project {
     pub fn get_env_mappings(&self) -> HashMap<String, String> {
         serde_json::from_str(&self.env_mappings).unwrap_or_default()
+    }
+
+    /// Returns one of: "active", "expired", "revoked".
+    pub fn token_status(&self) -> &'static str {
+        if self.token_revoked_at.is_some() {
+            return "revoked";
+        }
+        if let Some(exp) = &self.token_expires_at {
+            if let Ok(exp_dt) = chrono::NaiveDateTime::parse_from_str(exp, "%Y-%m-%d %H:%M:%S") {
+                let now = chrono::Utc::now().naive_utc();
+                if exp_dt <= now {
+                    return "expired";
+                }
+            }
+        }
+        "active"
     }
 }
 

@@ -839,3 +839,307 @@ async fn test_rotate_key() {
     // This is expected and documented: server restart with new key required
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ====================== TOKEN LIFECYCLE TESTS ======================
+
+async fn discover_for(app: &axum::Router, auth_proof: &str, project: &str) -> (String, String) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": project, "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let token = body["project_token"].as_str().unwrap().to_string();
+    let expires = body["token_expires_at"].as_str().unwrap().to_string();
+    (token, expires)
+}
+
+#[tokio::test]
+async fn test_discover_returns_token_expiration_metadata() {
+    let (app, auth_proof) = setup_app_with_secrets().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "lifecycle-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let body = body_json(resp.into_body()).await;
+
+    assert!(body["token_expires_at"].as_str().is_some());
+    // Default TTL: 120 minutes = 7200 seconds.
+    assert_eq!(body["token_ttl_seconds"], 7200);
+}
+
+#[tokio::test]
+async fn test_revoke_project_token_blocks_secrets_access() {
+    let (app, auth_proof) = setup_app_with_secrets().await;
+
+    let (token, _) = discover_for(&app, &auth_proof, "revoke-project").await;
+
+    // Sanity check: token works.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/revoke-project")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Revoke via admin endpoint.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/revoke-project/revoke")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["revoked"], true);
+
+    // Same token now returns 401 with error_code=token_revoked.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/revoke-project")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["error_code"], "token_revoked");
+}
+
+#[tokio::test]
+async fn test_revoke_unknown_project_returns_404() {
+    let app = setup_test_app().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/does-not-exist/revoke")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_auto_rotation_after_revoke_via_discover() {
+    let (app, auth_proof) = setup_app_with_secrets().await;
+
+    let (original_token, _) = discover_for(&app, &auth_proof, "auto-rot-project").await;
+
+    // Revoke the token.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/auto-rot-project/revoke")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    // Re-discover WITHOUT regenerate_token=true should still succeed (auto-rotation).
+    let proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": proof2,
+                "context": {"project_name": "auto-rot-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let new_token = body["project_token"].as_str().unwrap().to_string();
+    assert_ne!(new_token, original_token, "auto-rotation must mint a fresh token");
+
+    // New token works.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/auto-rot-project")
+        .header("authorization", format!("Bearer {}", new_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_admin_projects_list_includes_token_status() {
+    let (app, auth_proof) = setup_app_with_secrets().await;
+
+    discover_for(&app, &auth_proof, "status-project").await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/projects")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    let project = list.iter().find(|p| p["project_name"] == "status-project").unwrap();
+    assert_eq!(project["token_status"], "active");
+    assert!(project["token_expires_at"].as_str().is_some());
+
+    // Revoke and re-check.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/status-project/revoke")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/projects")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    let project = list.iter().find(|p| p["project_name"] == "status-project").unwrap();
+    assert_eq!(project["token_status"], "revoked");
+}
+
+#[tokio::test]
+async fn test_expired_token_returns_token_expired_error_code() {
+    use cortex_server::{build_router, config::AppConfig, db, state::AppState};
+
+    // Build app on a pool we keep a handle to, so we can backdate the token
+    // expiry directly in SQL to simulate the 120-minute boundary elapsing.
+    let config = AppConfig::test_config();
+    let pool = db::create_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let state = AppState::new(pool.clone(), config);
+    let app = build_router(state);
+
+    // Seed an agent + secret + project via the admin/discover endpoints.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/agents")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"agent_id": "discover-agent", "jwt_secret": "discover-jwt-secret"})
+                .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"key_path": "openai_api_key", "secret_type": "KEY_VALUE", "value": "sk-x"})
+                .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let auth_proof = make_agent_jwt("discover-agent", "discover-jwt-secret");
+    let (token, _) = discover_for(&app, &auth_proof, "expiry-project").await;
+
+    // Backdate the token expiry to one minute ago.
+    sqlx::query(
+        "UPDATE projects SET token_expires_at = datetime('now', '-1 minutes') WHERE project_name = ?",
+    )
+    .bind("expiry-project")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/expiry-project")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["error_code"], "token_expired");
+
+    // Re-discover should auto-rotate (no regenerate_token=true needed).
+    let auth_proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "discover-agent",
+                "auth_proof": auth_proof2,
+                "context": {"project_name": "expiry-project", "file_content": "OPENAI_API_KEY="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let new_token = body["project_token"].as_str().unwrap();
+    assert_ne!(new_token, token);
+}
+
+#[tokio::test]
+async fn test_token_status_helper() {
+    use cortex_server::models::project::Project;
+
+    let mut p = Project {
+        id: "x".into(),
+        project_name: "x".into(),
+        project_token_hash: "x".into(),
+        env_mappings: "{}".into(),
+        namespace: "default".into(),
+        created_at: "2026-01-01 00:00:00".into(),
+        updated_at: "2026-01-01 00:00:00".into(),
+        token_expires_at: Some(
+            (chrono::Utc::now() + chrono::Duration::minutes(60))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        ),
+        token_revoked_at: None,
+    };
+    assert_eq!(p.token_status(), "active");
+
+    p.token_expires_at = Some(
+        (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
+    );
+    assert_eq!(p.token_status(), "expired");
+
+    p.token_revoked_at = Some("2026-01-01 00:00:00".into());
+    assert_eq!(p.token_status(), "revoked");
+}
