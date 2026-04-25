@@ -4,6 +4,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -15,7 +16,10 @@ use crate::{
     models::{
         agent::{Agent, AgentClaims},
         policy::Policy,
-        project::{parse_env_file, DiscoverRequest, DiscoverResponse, SecretsResponse},
+        project::{
+            parse_env_file, DiscoverRequest, DiscoverResponse, SecretsResponse,
+            DEFAULT_TOKEN_TTL_MINUTES,
+        },
     },
     state::AppState,
 };
@@ -30,6 +34,8 @@ pub fn project_router() -> Router<AppState> {
         .route("/secrets/:project_name", get(get_secrets))
         .route("/config/:project_name/:app_name", get(get_config))
 }
+
+const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     headers
@@ -84,6 +90,11 @@ fn path_allowed_by_policies(path: &str, matching_policies: &[Policy]) -> bool {
     }
 
     allowed.iter().any(|pat| path_matches_pattern(path, pat))
+}
+
+/// SQLite-friendly format matching `datetime('now')` output ("YYYY-MM-DD HH:MM:SS").
+fn format_sqlite_timestamp(t: chrono::DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 async fn discover(
@@ -163,32 +174,57 @@ async fn discover(
     let full_matched = unmatched.is_empty() && !env_keys.is_empty();
 
     let existing = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at FROM projects WHERE project_name = ?",
+        &format!("{} WHERE project_name = ?", PROJECT_SELECT),
     )
     .bind(project_name)
     .fetch_optional(&state.pool)
     .await?;
 
-    let project_token = if existing.is_some() {
-        if req.regenerate_token.unwrap_or(false) {
+    let now = Utc::now();
+    let expires_at = now + Duration::minutes(DEFAULT_TOKEN_TTL_MINUTES);
+    let expires_at_str = format_sqlite_timestamp(expires_at);
+
+    let project_token = if let Some(existing_proj) = &existing {
+        // Auto-rotate when caller explicitly asks, OR when the existing token is
+        // already expired/revoked. This means an agent re-running discover after
+        // a 120-minute idle window seamlessly receives a fresh token.
+        let status = existing_proj.token_status();
+        let auto_rotate = status == "expired" || status == "revoked";
+
+        if req.regenerate_token.unwrap_or(false) || auto_rotate {
             let token = crypto::generate_token();
             let hash = crypto::hash_token(&token);
             let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
             sqlx::query(
-                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, updated_at = datetime('now') WHERE project_name = ?",
+                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, token_expires_at = ?, token_revoked_at = NULL, updated_at = datetime('now') WHERE project_name = ?",
             )
             .bind(&hash)
             .bind(&mappings_json)
             .bind(&namespace)
+            .bind(&expires_at_str)
             .bind(project_name)
             .execute(&state.pool)
             .await?;
 
+            audit::write(
+                &state,
+                Some(&agent_id),
+                Some(project_name),
+                if auto_rotate && !req.regenerate_token.unwrap_or(false) {
+                    "auto_rotate_token"
+                } else {
+                    "rotate_token"
+                },
+                Some(project_name),
+                "success",
+            )
+            .await;
+
             token
         } else {
             return Err(AppError::Conflict(
-                "Project already registered. Pass regenerate_token=true to rotate the token."
+                "Project already registered with an active token. Pass regenerate_token=true to rotate, or wait for it to expire."
                     .into(),
             ));
         }
@@ -199,13 +235,14 @@ async fn discover(
         let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
         sqlx::query(
-            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, namespace) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, namespace, token_expires_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(project_name)
         .bind(&hash)
         .bind(&mappings_json)
         .bind(&namespace)
+        .bind(&expires_at_str)
         .execute(&state.pool)
         .await?;
 
@@ -226,6 +263,8 @@ async fn discover(
         mapped_keys,
         full_matched,
         project_token,
+        token_expires_at: expires_at_str,
+        token_ttl_seconds: DEFAULT_TOKEN_TTL_MINUTES * 60,
         unmatched_keys: unmatched,
         namespace,
     }))
@@ -237,7 +276,7 @@ async fn get_project_by_token(
     token: &str,
 ) -> Result<crate::models::project::Project, AppError> {
     let project = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at FROM projects WHERE project_name = ?",
+        &format!("{} WHERE project_name = ?", PROJECT_SELECT),
     )
     .bind(project_name)
     .fetch_optional(&state.pool)
@@ -246,6 +285,34 @@ async fn get_project_by_token(
 
     if !crypto::verify_token(token, &project.project_token_hash) {
         return Err(AppError::Unauthorized("Invalid project token".into()));
+    }
+
+    // Reject revoked tokens before checking expiration so the caller gets the
+    // most actionable error code.
+    if project.token_revoked_at.is_some() {
+        audit::write(
+            state,
+            None,
+            Some(project_name),
+            "token_validation",
+            Some(project_name),
+            "revoked",
+        )
+        .await;
+        return Err(AppError::token_revoked());
+    }
+
+    if project.token_status() == "expired" {
+        audit::write(
+            state,
+            None,
+            Some(project_name),
+            "token_validation",
+            Some(project_name),
+            "expired",
+        )
+        .await;
+        return Err(AppError::token_expired());
     }
 
     Ok(project)

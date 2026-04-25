@@ -767,17 +767,31 @@ const Projects = {
       const rows = await API.get('/admin/projects');
       if (!rows.length) { el.innerHTML = emptyHTML('📁', 'No projects', 'Projects are registered via the /agent/discover endpoint.'); return; }
       el.innerHTML = `<table>
-        <thead><tr><th>Project Name</th><th>Namespace</th><th>Env Mappings</th><th>Created</th></tr></thead>
+        <thead><tr><th>Project Name</th><th>Namespace</th><th>Env Mappings</th><th>Token Status</th><th>Expires</th><th>Created</th><th>Actions</th></tr></thead>
         <tbody>${rows.map(p => {
           const m = p.env_mappings || {};
           const n = Object.keys(m).length;
           const viewBtn = n ? `<button class="btn btn-secondary btn-sm" style="margin-left:6px"
             onclick='Projects.showMappings(${JSON.stringify(JSON.stringify(m))},${JSON.stringify(p.project_name)})'>View</button>` : '';
+          const statusBadge = (() => {
+            switch (p.token_status) {
+              case 'active':  return `<span class="badge badge-blue">active</span>`;
+              case 'expired': return `<span class="badge badge-gray">expired</span>`;
+              case 'revoked': return `<span class="badge" style="background:#fee2e2;color:#991b1b">revoked</span>`;
+              default:        return `<span class="badge badge-gray">${esc(p.token_status||'?')}</span>`;
+            }
+          })();
+          const revokeBtn = (p.token_status === 'active')
+            ? `<button class="btn btn-secondary btn-sm" onclick="Projects.revoke(${JSON.stringify(p.project_name)})">Revoke token</button>`
+            : `<span style="color:var(--text-light);font-size:12px">—</span>`;
           return `<tr>
             <td><strong>${esc(p.project_name)}</strong></td>
             <td><span class="badge badge-gray">${esc(p.namespace||'default')}</span></td>
             <td><span class="badge badge-blue">${n} mapping${n!==1?'s':''}</span>${viewBtn}</td>
+            <td>${statusBadge}</td>
+            <td style="color:var(--text-light);font-size:12px">${esc(p.token_expires_at||'—')}</td>
             <td style="color:var(--text-light);font-size:12px">${fmtDate(p.created_at)}</td>
+            <td>${revokeBtn}</td>
           </tr>`;
         }).join('')}</tbody></table>`;
     } catch(e) {
@@ -794,6 +808,17 @@ const Projects = {
     openModal(`${name} — Env Mappings`,
       `<table><thead><tr><th>ENV Variable</th><th></th><th>Secret Path</th></tr></thead><tbody>${rows}</tbody></table>`,
       `<button class="btn btn-secondary" onclick="closeModal()">Close</button>`);
+  },
+
+  async revoke(name) {
+    if (!confirm(`Revoke project token for "${name}"?\n\nThe agent will need to re-discover to obtain a fresh token.`)) return;
+    try {
+      await API.post(`/admin/projects/${encodeURIComponent(name)}/revoke`, {});
+      toast(`Token revoked for "${name}"`, 'success');
+      Projects.load();
+    } catch (e) {
+      toast('Error: ' + e.message, 'error');
+    }
   },
 };
 

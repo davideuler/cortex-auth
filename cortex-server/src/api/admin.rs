@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
         .route("/policies", get(list_policies).post(create_policy))
         .route("/policies/:id", delete(delete_policy))
         .route("/projects", get(list_projects))
+        .route("/projects/:project_name/revoke", post(revoke_project_token))
         .route("/audit-logs", get(list_audit_logs))
         .route("/rotate-key", post(rotate_key))
 }
@@ -432,7 +433,7 @@ async fn list_projects(
     check_admin_token(&headers, &state.config.admin_token)?;
 
     let rows = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at FROM projects ORDER BY created_at",
+        "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at, token_expires_at, token_revoked_at FROM projects ORDER BY created_at",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -445,10 +446,63 @@ async fn list_projects(
             env_mappings: p.get_env_mappings(),
             namespace: p.namespace.clone(),
             created_at: p.created_at.clone(),
+            token_expires_at: p.token_expires_at.clone(),
+            token_revoked_at: p.token_revoked_at.clone(),
+            token_status: p.token_status().to_string(),
         })
         .collect();
 
     Ok(Json(items))
+}
+
+async fn revoke_project_token(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let result = sqlx::query(
+        "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
+    )
+    .bind(&project_name)
+    .execute(&state.pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        // Distinguish "not found" from "already revoked".
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT project_name FROM projects WHERE project_name = ?")
+                .bind(&project_name)
+                .fetch_optional(&state.pool)
+                .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound(format!(
+                "Project '{}' not found",
+                project_name
+            )));
+        }
+        return Ok(Json(json!({
+            "revoked": true,
+            "project_name": project_name,
+            "already_revoked": true,
+        })));
+    }
+
+    audit::write(
+        &state,
+        None,
+        Some(&project_name),
+        "revoke_project_token",
+        Some(&project_name),
+        "success",
+    )
+    .await;
+
+    Ok(Json(json!({
+        "revoked": true,
+        "project_name": project_name,
+    })))
 }
 
 async fn list_audit_logs(
