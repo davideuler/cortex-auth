@@ -15,10 +15,14 @@ use crate::{
     models::{
         agent::{AgentListItem, CreateAgentRequest},
         audit_log::AuditLog,
+        daemon_session::{AllowedDaemonVersion, CreateAllowedDaemonVersion},
         namespace::{CreateNamespaceRequest, Namespace},
         notification::{
             is_valid_channel_type, CreateNotificationChannelRequest, NotificationChannel,
             NotificationChannelListItem, UpdateNotificationChannelRequest,
+        },
+        pending_grant::{
+            ApproveGrantRequest, PendingGrant, PendingGrantListItem, AUTO_APPROVAL_WINDOW_DAYS,
         },
         policy::{CreatePolicyRequest, PolicyDetail},
         project::ProjectListItem,
@@ -62,6 +66,19 @@ pub fn router() -> Router<AppState> {
         .route("/devices", get(list_devices))
         .route("/devices/:agent_id", delete(delete_device))
         .route("/web/device/approve", post(web_device_approve))
+        .route("/pending-grants", get(list_pending_grants))
+        .route("/pending-grants/:id/approve", post(approve_pending_grant))
+        .route("/pending-grants/:id/deny", post(deny_pending_grant))
+        .route("/pending-grants/:id", delete(delete_pending_grant))
+        .route(
+            "/allowed-daemon-versions",
+            get(list_allowed_daemon_versions).post(create_allowed_daemon_version),
+        )
+        .route(
+            "/allowed-daemon-versions/:sha",
+            delete(delete_allowed_daemon_version),
+        )
+        .route("/daemon-sessions", get(list_daemon_sessions))
 }
 
 fn check_admin_token(headers: &HeaderMap, expected_hash: &str) -> Result<(), AppError> {
@@ -1064,3 +1081,315 @@ async fn delete_device(
     audit::write(&state, Some(&agent_id), None, "device_delete", None, "success").await;
     Ok(Json(json!({ "deleted": true, "rows": result.rows_affected() })))
 }
+
+// ─── Pending grants (UNCERTAINTIES #16 — first-access approval) ──────────
+
+const PENDING_GRANT_SELECT: &str =
+    "SELECT id, agent_id, project_name, namespace, requested_keys, approved_keys, \
+            status, requested_at, decided_at, decided_by, auto_approval_until, source_ip \
+     FROM pending_grants";
+
+async fn list_pending_grants(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PendingGrantListItem>>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let rows = sqlx::query_as::<_, PendingGrant>(
+        &format!("{} ORDER BY requested_at DESC LIMIT 500", PENDING_GRANT_SELECT),
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
+async fn approve_pending_grant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ApproveGrantRequest>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let row = sqlx::query_as::<_, PendingGrant>(
+        &format!("{} WHERE id = ?", PENDING_GRANT_SELECT),
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("pending_grant '{}' not found", id)))?;
+
+    if row.status != "pending" {
+        return Err(AppError::Conflict(format!(
+            "pending_grant '{}' is already {}",
+            id, row.status
+        )));
+    }
+
+    // Default to approving exactly the requested set; allow narrowing.
+    let requested = row.requested_keys_vec();
+    let approved: Vec<String> = match req.approved_keys {
+        Some(list) => {
+            let req_set: std::collections::HashSet<&str> =
+                requested.iter().map(|s| s.as_str()).collect();
+            for k in &list {
+                if !req_set.contains(k.as_str()) {
+                    return Err(AppError::BadRequest(format!(
+                        "approved_keys contains '{}' which was not in requested_keys",
+                        k
+                    )));
+                }
+            }
+            list
+        }
+        None => requested.clone(),
+    };
+    let approved_json = serde_json::to_string(&approved).unwrap();
+
+    let until =
+        chrono::Utc::now() + chrono::Duration::days(AUTO_APPROVAL_WINDOW_DAYS);
+    let until_str = until.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    sqlx::query(
+        "UPDATE pending_grants SET status = 'approved', approved_keys = ?, \
+            decided_at = datetime('now'), decided_by = 'admin', auto_approval_until = ? \
+         WHERE id = ?",
+    )
+    .bind(&approved_json)
+    .bind(&until_str)
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+
+    audit::write(
+        &state,
+        Some(&row.agent_id),
+        Some(&row.project_name),
+        "pending_grant_approve",
+        Some(&id),
+        "success",
+    )
+    .await;
+
+    Ok(Json(json!({
+        "approved": true,
+        "id": id,
+        "approved_keys": approved,
+        "auto_approval_until": until_str,
+    })))
+}
+
+async fn deny_pending_grant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let row = sqlx::query_as::<_, PendingGrant>(
+        &format!("{} WHERE id = ?", PENDING_GRANT_SELECT),
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("pending_grant '{}' not found", id)))?;
+
+    if row.status != "pending" {
+        return Err(AppError::Conflict(format!(
+            "pending_grant '{}' is already {}",
+            id, row.status
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE pending_grants SET status = 'denied', decided_at = datetime('now'), \
+                                   decided_by = 'admin' WHERE id = ?",
+    )
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+
+    audit::write(
+        &state,
+        Some(&row.agent_id),
+        Some(&row.project_name),
+        "pending_grant_deny",
+        Some(&id),
+        "denied",
+    )
+    .await;
+
+    Ok(Json(json!({"denied": true, "id": id})))
+}
+
+async fn delete_pending_grant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let result = sqlx::query("DELETE FROM pending_grants WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("pending_grant '{}' not found", id)));
+    }
+
+    audit::write(&state, None, None, "pending_grant_delete", Some(&id), "success").await;
+    Ok(Json(json!({"deleted": true, "id": id})))
+}
+
+// ─── allowed_daemon_versions / daemon_sessions (#17) ────────────────────
+
+async fn list_allowed_daemon_versions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AllowedDaemonVersion>>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let rows = sqlx::query_as::<_, AllowedDaemonVersion>(
+        "SELECT binary_sha256, version, description, enabled, created_at \
+         FROM allowed_daemon_versions ORDER BY created_at DESC",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(rows))
+}
+
+async fn create_allowed_daemon_version(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<CreateAllowedDaemonVersion>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let sha = req.binary_sha256.trim().to_lowercase();
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::BadRequest(
+            "binary_sha256 must be 64 hex characters".into(),
+        ));
+    }
+
+    let enabled: i64 = if req.enabled.unwrap_or(true) { 1 } else { 0 };
+
+    sqlx::query(
+        "INSERT INTO allowed_daemon_versions (binary_sha256, version, description, enabled) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(&sha)
+    .bind(&req.version)
+    .bind(&req.description)
+    .bind(enabled)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint") {
+            AppError::Conflict(format!(
+                "binary_sha256 '{}' already in allowlist",
+                sha
+            ))
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    audit::write(
+        &state,
+        None,
+        None,
+        "allowed_daemon_version_add",
+        Some(&sha),
+        "success",
+    )
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"binary_sha256": sha, "enabled": enabled == 1})),
+    ))
+}
+
+async fn delete_allowed_daemon_version(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(sha): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let result = sqlx::query("DELETE FROM allowed_daemon_versions WHERE binary_sha256 = ?")
+        .bind(&sha)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!(
+            "binary_sha256 '{}' not in allowlist",
+            sha
+        )));
+    }
+
+    audit::write(
+        &state,
+        None,
+        None,
+        "allowed_daemon_version_remove",
+        Some(&sha),
+        "success",
+    )
+    .await;
+    Ok(Json(json!({"deleted": true})))
+}
+
+async fn list_daemon_sessions(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT session_id, agent_id, binary_sha256, daemon_version, daemon_pid, \
+                daemon_uid, hostname, created_at, expires_at, revoked_at \
+         FROM daemon_sessions ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(sid, ag, sha, ver, pid, uid, host, created, exp, rev)| {
+                    json!({
+                        "session_id": sid,
+                        "agent_id": ag,
+                        "binary_sha256": sha,
+                        "daemon_version": ver,
+                        "daemon_pid": pid,
+                        "daemon_uid": uid,
+                        "hostname": host,
+                        "created_at": created,
+                        "expires_at": exp,
+                        "revoked_at": rev,
+                    })
+                },
+            )
+            .collect(),
+    ))
+}
+
+

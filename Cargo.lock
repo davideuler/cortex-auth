@@ -419,15 +419,19 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "hex",
+ "libc",
  "rand_core 0.6.4",
  "reqwest",
  "rpassword",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -245,10 +245,23 @@ request body.
 
 ### Launch a process with secrets
 
+`cortex-cli run` no longer accepts `--token`, `--agent-id`, or
+`--priv-key-file`. The running `cortex-daemon` (started once after
+`cortex-cli daemon login`) holds the project token, auto-rotates it on
+expiry, and injects secrets into the child process. The CLI never sees
+either the token or the secret values.
+
 ```bash
+# One-time: register the daemon (OAuth 2.0 device-grant).
+cortex-cli daemon login --url http://localhost:3000
+# Visit the printed URL on the dashboard to approve the user_code.
+
+# Start the daemon (idempotent; one per user account).
+nohup cortex-daemon >/var/log/cortex-daemon.log 2>&1 &
+
+# Launch any process with secrets injected.
 cortex-cli run \
   --project my-app \
-  --token <project_token> \
   --url http://localhost:3000 \
   -- python3 main.py
 ```
@@ -257,7 +270,6 @@ cortex-cli run \
 
 ```bash
 export CORTEX_PROJECT=my-app
-export CORTEX_TOKEN=<project_token>
 export CORTEX_URL=http://cortex-server:3000
 
 cortex-cli run -- ./start.sh
@@ -273,11 +285,21 @@ cortex-cli sign-proof --help
 
 ### How It Works
 
-1. `cortex-cli run` fetches secrets from `/project/secrets/<project>`
-2. Injects the returned env vars into the process environment
-3. `exec()`s the specified command — the CLI process is **replaced** by the child
-4. The child process inherits all injected secrets as env vars
-5. Secrets are **never printed** to stdout/stderr
+1. `cortex-cli run` connects to the daemon Unix socket
+   (`~/.cortex/agent.sock`).
+2. The daemon checks its in-memory + on-disk
+   (`~/.cortex/daemon-projects.json`, mode 0600) project-token cache. On
+   miss or expiry it calls `/agent/discover` itself, signs the request
+   with the agent's Ed25519 private key, and updates the cache.
+3. The daemon fetches secrets from `/project/secrets/<project>`,
+   forwards an `X-Daemon-Attestation` header signed by an
+   ephemeral-per-process Ed25519 key, and spawns the child program with
+   the env vars injected.
+4. The CLI receives only `{"ok":true,"exit_code":N}` — secret values
+   never traverse the socket.
+5. If the project requires first-access admin approval, the CLI exits 1
+   with a `pending_approval` message including the `grant_id`; approve
+   it on the dashboard and re-run.
 
 ### Example: Launch a Python agent with secrets
 
@@ -286,15 +308,17 @@ cortex-cli sign-proof --help
 # OPENAI_API_KEY=
 # ANTHROPIC_API_KEY=
 
-# After setting up secrets in CortexAuth and running discover:
+# After setting up secrets in CortexAuth and approving the agent's
+# pending grant on the dashboard:
 cortex-cli run \
   --project my-ai-agent \
-  --token $PROJECT_TOKEN \
   --url http://cortex:3000 \
   -- python3 -m my_agent.main
 ```
 
-The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its environment without them ever appearing in any configuration file or shell history.
+The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its
+environment without them ever appearing in any configuration file, shell
+history, or socket payload.
 
 ---
 
@@ -480,24 +504,27 @@ channel.
 ## cortex-daemon + Device Authorization (#16)
 
 ```bash
-# 1. Start the daemon (Unix socket at ~/.cortex/agent.sock, mode 0600).
-cortex-daemon &
-
-# 2. Trigger the OAuth 2.0 device-authorization grant.
+# 1. Trigger the OAuth 2.0 device-authorization grant on the agent host.
 cortex-cli daemon login --url http://localhost:3000
 # [cortex-cli] visit http://localhost:3000/device and approve user_code: ABCD-1234
 # [cortex-cli] polling…
 
-# 3. Approve from the dashboard's Devices tab (or directly):
+# 2. Approve from the dashboard's Devices tab (or directly):
 curl -X POST http://localhost:3000/admin/web/device/approve \
   -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"user_code":"ABCD-1234","agent_id":"my-agent"}'
 
-# 4. The daemon now holds an EdDSA access token.
+# 3. Start the daemon (Unix socket at ~/.cortex/agent.sock, mode 0600).
+#    The daemon registers an ephemeral attestation key with the server,
+#    enforces SO_PEERCRED on every connection, and prevents ptrace via
+#    PR_SET_DUMPABLE=0 + mlockall.
+cortex-daemon &
+
+# 4. Inspect the daemon (cached session + active attestation session_id).
 cortex-cli daemon status
 # daemon session @ http://localhost:3000 (expires_in=2592000s)
 
-# 5. Forget the session.
+# 5. Forget the cached login session.
 cortex-cli daemon logout
 ```
 
@@ -506,14 +533,138 @@ Direct socket protocol (one-line JSON request, one-line JSON response):
 ```bash
 echo '{"cmd":"status"}' | nc -U ~/.cortex/agent.sock
 
+# `run` no longer takes a token — the daemon discovers and rotates it.
 echo '{"cmd":"run","program":"python","args":["main.py"],
-       "project":"my-app","token":"<project_token>",
-       "url":"http://localhost:3000"}' | nc -U ~/.cortex/agent.sock
+       "project":"my-app","url":"http://localhost:3000"}' \
+  | nc -U ~/.cortex/agent.sock
 ```
 
 The daemon spawns the child with the secrets injected as env vars and
 returns `{"ok":true,"exit_code":N}` once it exits — the raw secret values
-never travel back over the socket.
+never travel back over the socket. When the project requires admin
+approval, the daemon returns
+`{"ok":false,"error_code":"pending_approval","grant_id":"...","requested_keys":[...]}`
+instead, so the CLI can print an actionable message.
+
+### systemd unit (recommended)
+
+```ini
+[Unit]
+Description=CortexAuth agent daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cortex-agent
+ExecStart=/usr/local/bin/cortex-daemon
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+PrivateTmp=yes
+CapabilityBoundingSet=CAP_IPC_LOCK
+AmbientCapabilities=CAP_IPC_LOCK
+
+[Install]
+WantedBy=default.target
+```
+
+`CAP_IPC_LOCK` is needed for `mlockall(2)` to lock secret-bearing pages.
+
+---
+
+## First-Access Approval (`pending_grants`, #16)
+
+A new `(agent_id, project_name)` pair triggers an admin gate before any
+secret leaves the server. The first `/agent/discover` returns
+HTTP 403 with body:
+
+```json
+{
+  "error_code": "pending_approval",
+  "details": {
+    "grant_id": "<uuid>",
+    "requested_keys": ["OPENAI_API_KEY", "DASHSCOPE_API_KEY"],
+    "agent_id": "my-agent",
+    "project_name": "my-app"
+  }
+}
+```
+
+A row is inserted into `pending_grants` and a notification is dispatched
+to every enabled channel. The dashboard's "🔔 Pending Grants" tab lists
+all open requests; admins approve/deny with:
+
+```bash
+# List
+curl -H "X-Admin-Token: $ADMIN_TOKEN" \
+  http://localhost:3000/admin/pending-grants
+
+# Approve all requested keys
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" -d '{}' \
+  http://localhost:3000/admin/pending-grants/<grant_id>/approve
+
+# Approve a subset
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"approved_keys":["OPENAI_API_KEY"]}' \
+  http://localhost:3000/admin/pending-grants/<grant_id>/approve
+
+# Deny
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  http://localhost:3000/admin/pending-grants/<grant_id>/deny
+```
+
+After approval, subsequent `/agent/discover` calls within a 30-day
+auto-approval window pass through transparently as long as the
+requested env-key set is a subset of the approved keys. A wider scope
+re-opens the approval workflow.
+
+---
+
+## Daemon Attestation Allowlist (#17)
+
+Every running daemon registers itself at startup with `POST
+/daemon/attest`, sending its binary SHA-256, ephemeral attestation
+public key, version, PID, UID, and hostname. The server stores this in
+`daemon_sessions` and pins all subsequent sensitive requests to the
+ephemeral private key via the `X-Daemon-Attestation` header.
+
+To enforce a release allowlist:
+
+```bash
+# Compute the daemon SHA-256 you want to allow.
+sha256sum /usr/local/bin/cortex-daemon
+# 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08  cortex-daemon
+
+# Add it to the allowlist (admin-only).
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"binary_sha256":"9f86d081...","version":"0.1.0","description":"prod build"}' \
+  http://localhost:3000/admin/allowed-daemon-versions
+
+# List active daemon sessions and the allowlist via the dashboard's
+# "🛡️ Daemon Allowlist" page or:
+curl -H "X-Admin-Token: $ADMIN_TOKEN" \
+  http://localhost:3000/admin/daemon-sessions
+curl -H "X-Admin-Token: $ADMIN_TOKEN" \
+  http://localhost:3000/admin/allowed-daemon-versions
+```
+
+When `allowed_daemon_versions` is **empty** the allowlist is **not
+enforced** (existing deployments do not break on upgrade). Add the
+first row to opt into enforcement; from then on, any daemon whose
+binary hash is missing — or marked `enabled=0` — fails attestation
+with HTTP 403 and `error_code: binary_not_allowed`.
 
 ---
 

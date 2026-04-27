@@ -1,5 +1,29 @@
 # CortexAuth — Next Steps, Optimizations & Security Hardening
 
+## Recently Completed (April 2026)
+
+- **Daemon-held tokens** *(`#16`)* — `cortex-cli run` no longer accepts
+  `--token`/`--agent-id`/`--priv-key-file`. The daemon discovers,
+  rotates, caches (`~/.cortex/daemon-projects.json`, mode 0600), and
+  injects everything; the CLI only exchanges line-JSON over the socket.
+- **First-access pending-grants approval** *(`#16`)* — every new
+  `(agent_id, project_name)` pair requires an admin approval on the
+  dashboard before any secret is released; subsequent requests within
+  30 days auto-pass when the requested key set is a subset.
+- **Daemon attestation header** *(`#17`)* — daemons generate ephemeral
+  Ed25519 attestation keypairs (private key never written to disk), post
+  `binary_sha256` + pubkey to `/daemon/attest`, and prove session
+  ownership on every sensitive request via `X-Daemon-Attestation`.
+  Operators curate `allowed_daemon_versions` from the dashboard;
+  empty table = enforcement off, so existing deployments don't break.
+- **Daemon process hardening** *(`#16` / `#17`)* — `prctl(PR_SET_DUMPABLE,
+  0)`, `mlockall(MCL_CURRENT|MCL_FUTURE)`, and per-connection
+  SO_PEERCRED checks on the Unix socket. Recommended systemd hardening
+  (`MemoryDenyWriteExecute=yes`, `NoNewPrivileges=yes`,
+  `CAP_IPC_LOCK`) documented in `docs/USAGE.md`.
+
+---
+
 ## Priority 1: Critical for Production
 
 ### Security

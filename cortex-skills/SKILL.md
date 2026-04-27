@@ -32,14 +32,17 @@ Project tokens are **short-lived** to limit blast radius if a token is leaked
 - **TTL: 120 minutes** from issuance (server-enforced).
 - **Revocable**: an admin can revoke a token at any time via the dashboard or
   `POST /admin/projects/{name}/revoke`.
-- **Auto-rotated**: when a token has expired or been revoked, calling
-  `/agent/discover` again returns a fresh token automatically — no
+- **Daemon-held**: project tokens never appear on the CLI, in shell
+  history, in environment variables, or on disk in plaintext. The
+  running `cortex-daemon` keeps them in mlock'd memory + a
+  mode-0600 cache at `~/.cortex/daemon-projects.json`.
+- **Auto-rotated**: when a token has expired or been revoked, the
+  daemon calls `/agent/discover` again automatically — no
   `regenerate_token=true` needed.
-- **Never logged**: tokens appear only in HTTP responses and are persisted to
-  `~/.cortex-token-<project>` with mode `0600`.
-
-`cortex-cli run` handles rotation transparently when `--agent-id` and
-`--priv-key-file` (or `CORTEX_AGENT_ID` / `CORTEX_PRIV_KEY_FILE`) are configured.
+- **Pending-grant gated**: the *first* discover for a new
+  `(agent_id, project_name)` pair waits on admin approval. After
+  approval, calls within a 30-day window auto-pass as long as the
+  requested env-key set is a subset of the approved keys.
 
 ## What you need from the human (one-time setup)
 
@@ -49,50 +52,50 @@ Before you can operate autonomously, a human admin must have:
    `cortex-cli gen-key --agent-id <id>` and uploaded the public key with
    `POST /admin/agents`. The private key stays locally at
    `~/.cortex/agent-<id>.key` (mode 0600) and is never sent over the wire.
-3. Stored the required secrets in Cortex (e.g., `OPENAI_API_KEY`, `SMTP_PASSWORD`)
+3. Run `cortex-cli daemon login --url $CORTEX_URL` once and approved the
+   user_code on the dashboard. This persists an OAuth 2.0 access token at
+   `~/.cortex/daemon-session.json` (mode 0600).
+4. Started `cortex-daemon` (background or systemd). The daemon registers
+   its binary SHA-256 + ephemeral attestation key with `/daemon/attest`
+   and listens on `~/.cortex/agent.sock`.
+5. Stored the required secrets in Cortex (e.g., `OPENAI_API_KEY`, `SMTP_PASSWORD`)
+6. Approved the **first** `(agent_id, project_name)` pending grant in
+   the dashboard's "🔔 Pending Grants" tab — subsequent runs pass through
+   for 30 days.
 
-These values — `CORTEX_URL`, `CORTEX_AGENT_ID`, plus the local private key file —
-are the **only** things you need from a human. Everything else is autonomous.
+These values — `CORTEX_URL` and `CORTEX_PROJECT` — plus a running daemon
+are the only things you need. The CLI never sees the project token.
 
-Store them in a local credentials file so future sessions don't need to ask again:
+Store them so future sessions don't need to ask again:
 ```
 ~/.cortex-credentials
 CORTEX_URL=http://your-server:3000
-CORTEX_AGENT_ID=agent-claude-01
-CORTEX_PRIV_KEY_FILE=/home/you/.cortex/agent-agent-claude-01.key
 ```
 
 Load them at the start of each session:
 ```bash
 source ~/.cortex-credentials
-# or export individually:
-export CORTEX_URL=http://your-server:3000
-export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
+export CORTEX_PROJECT=my-project
 ```
 
-## Recommended path: let cortex-cli handle the lifecycle
+## Recommended path: let cortex-cli + cortex-daemon handle the lifecycle
 
-The simplest and safest workflow — `cortex-cli run` will discover the token on
-first use, persist it, and auto-rotate it whenever it expires or is revoked:
+The simplest and safest workflow — the daemon discovers the token on
+first use, persists it, and auto-rotates it whenever it expires or is
+revoked. The CLI just sends a one-line JSON request to the daemon
+socket:
 
 ```bash
 export CORTEX_URL=http://your-server:3000
-export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
 export CORTEX_PROJECT=my-project
 
 cortex-cli run -- python app.py
 ```
 
-On first run (no saved token) you'll get an error asking you to discover. Bootstrap with:
-
-```bash
-cortex-cli discover --project my-project   # uses env vars for the rest
-```
-
-After that, repeated `cortex-cli run` calls will silently rotate the token at
-the 120-minute mark.
+If the daemon isn't running, `cortex-cli run` exits with a clear error
+pointing to `cortex-daemon`. If first-access approval is pending, the
+CLI exits 1 with `pending_approval` and the `grant_id` so the human
+admin knows exactly which row to approve.
 
 ## Step-by-step: manual flow (for scripts and curl)
 
@@ -164,30 +167,43 @@ if [ "$FULL_MATCHED" != "True" ]; then
 fi
 ```
 
-### Step 3 — Run your project with secrets injected
+### Step 3 — Run your project with secrets injected (via the daemon)
 
-Use `cortex-cli run` to launch any command. It fetches the secrets and `exec()`s
-your command with them as environment variables — the secrets are never visible
-in the process list or parent shell.
+Use `cortex-cli run` to launch any command. It sends one line of JSON to
+the running `cortex-daemon`, which performs the discover + secrets fetch
+internally and spawns the child with the env vars injected. The CLI
+process exits with the child's exit code; secrets never traverse the
+socket back to it.
 
 ```bash
 cortex-cli run \
   --project my-project \
-  --token "$PROJECT_TOKEN" \
   --url "$CORTEX_URL" \
   -- python app.py
 ```
 
-Or use environment variables and let the CLI pick up the saved token:
+Or use environment variables:
 ```bash
 export CORTEX_PROJECT=my-project
 export CORTEX_URL=http://your-server:3000
-# CORTEX_AGENT_ID + CORTEX_PRIV_KEY_FILE enable transparent auto-rotation
-export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
 
 cortex-cli run -- python app.py
 ```
+
+If `cortex-daemon` is not running you'll get:
+```
+Cannot connect to daemon socket /home/you/.cortex/agent.sock.
+Is cortex-daemon running? Start it with: cortex-daemon
+```
+
+If the project requires admin approval you'll get:
+```
+[cortex-cli] project access pending admin approval
+[cortex-cli] grant_id: 2f0b...
+[cortex-cli] requested_keys: ["OPENAI_API_KEY"]
+```
+…and the CLI exits 1.  Ask the admin to approve the grant from the
+dashboard's "🔔 Pending Grants" page.
 
 ## Token expiry & revocation: how it shows up
 

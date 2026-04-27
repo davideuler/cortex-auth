@@ -14,6 +14,7 @@ use crate::{
     error::AppError,
     models::{
         agent::Agent,
+        pending_grant::{PendingGrant, AUTO_APPROVAL_WINDOW_DAYS},
         policy::Policy,
         project::{
             parse_env_file, DiscoverRequest, DiscoverResponse, SecretsResponse,
@@ -139,6 +140,7 @@ fn open_secret_value(
 
 async fn discover(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
     let agent = sqlx::query_as::<_, Agent>(
@@ -237,6 +239,85 @@ async fn discover(
         v
     };
     let scope_json = serde_json::to_string(&scope_paths).unwrap();
+
+    // First-access human approval (UNCERTAINTIES #16). Only gate when the
+    // requested scope is non-empty — an empty .env file produces an empty
+    // scope and there is nothing to gate.
+    if !scope_paths.is_empty() {
+        let source_ip = headers
+            .get("x-forwarded-for")
+            .or_else(|| headers.get("x-real-ip"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        match check_or_create_pending_grant(
+            &state,
+            &agent_id,
+            project_name,
+            &namespace,
+            &scope_paths,
+            source_ip,
+        )
+        .await?
+        {
+            PendingGrantOutcome::Approved => {
+                // continue — token issuance below.
+            }
+            PendingGrantOutcome::Pending {
+                grant_id,
+                requested_keys,
+                already_pending,
+            } => {
+                let action = if already_pending {
+                    "discover_pending_existing"
+                } else {
+                    "discover_pending_new"
+                };
+                audit::write(
+                    &state,
+                    Some(&agent_id),
+                    Some(project_name),
+                    action,
+                    Some(project_name),
+                    "pending",
+                )
+                .await;
+                return Err(AppError::Forbidden {
+                    code: "pending_approval",
+                    message: format!(
+                        "First-time access for agent '{}' to project '{}' is awaiting human \
+                         approval at /admin/pending-grants/{}.",
+                        agent_id, project_name, grant_id
+                    ),
+                    details: Some(serde_json::json!({
+                        "grant_id": grant_id,
+                        "requested_keys": requested_keys,
+                        "agent_id": agent_id,
+                        "project_name": project_name,
+                    })),
+                });
+            }
+            PendingGrantOutcome::Denied => {
+                audit::write(
+                    &state,
+                    Some(&agent_id),
+                    Some(project_name),
+                    "discover_denied",
+                    Some(project_name),
+                    "denied",
+                )
+                .await;
+                return Err(AppError::Forbidden {
+                    code: "grant_denied",
+                    message: "Access for this (agent, project) was explicitly denied by an \
+                              administrator. Contact your operator if you believe this is in \
+                              error."
+                        .into(),
+                    details: None,
+                });
+            }
+        }
+    }
 
     let project_token = if let Some(existing_proj) = &existing {
         let status = existing_proj.token_status();
@@ -344,6 +425,102 @@ async fn discover(
         signed_project_token,
     }))
 }
+
+enum PendingGrantOutcome {
+    Approved,
+    Pending {
+        grant_id: String,
+        requested_keys: Vec<String>,
+        already_pending: bool,
+    },
+    Denied,
+}
+
+/// Decide whether the supplied `(agent_id, project_name, namespace, scope)`
+/// is already covered by an approved `pending_grants` row, or needs human
+/// review. When a fresh review is needed, inserts a `pending` row and fires
+/// an outbound notification so the operator dashboard pings.
+async fn check_or_create_pending_grant(
+    state: &AppState,
+    agent_id: &str,
+    project_name: &str,
+    namespace: &str,
+    requested_keys: &[String],
+    source_ip: Option<String>,
+) -> Result<PendingGrantOutcome, AppError> {
+    let existing: Vec<PendingGrant> = sqlx::query_as::<_, PendingGrant>(
+        "SELECT id, agent_id, project_name, namespace, requested_keys, approved_keys, \
+                status, requested_at, decided_at, decided_by, auto_approval_until, source_ip \
+         FROM pending_grants \
+         WHERE agent_id = ? AND project_name = ? AND namespace = ? \
+         ORDER BY requested_at DESC",
+    )
+    .bind(agent_id)
+    .bind(project_name)
+    .bind(namespace)
+    .fetch_all(&state.pool)
+    .await?;
+
+    // Any approved + still-in-window grant whose approved_keys ⊇ requested → pass.
+    if existing.iter().any(|g| g.covers(requested_keys)) {
+        return Ok(PendingGrantOutcome::Approved);
+    }
+
+    // Any non-expired denial (decided_by an admin) → block.
+    if existing
+        .iter()
+        .any(|g| g.status == "denied" && g.decided_at.is_some())
+    {
+        return Ok(PendingGrantOutcome::Denied);
+    }
+
+    // Existing pending row → don't spam, return its id.
+    if let Some(pending) = existing.iter().find(|g| g.status == "pending") {
+        return Ok(PendingGrantOutcome::Pending {
+            grant_id: pending.id.clone(),
+            requested_keys: pending.requested_keys_vec(),
+            already_pending: true,
+        });
+    }
+
+    // No covering grant → insert a fresh pending row and notify.
+    let id = Uuid::new_v4().to_string();
+    let requested_json = serde_json::to_string(requested_keys).unwrap_or_else(|_| "[]".into());
+    sqlx::query(
+        "INSERT INTO pending_grants (id, agent_id, project_name, namespace, requested_keys, \
+                                     status, source_ip) \
+         VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+    )
+    .bind(&id)
+    .bind(agent_id)
+    .bind(project_name)
+    .bind(namespace)
+    .bind(&requested_json)
+    .bind(source_ip.as_deref())
+    .execute(&state.pool)
+    .await?;
+
+    crate::notifications::dispatch(
+        state,
+        crate::notifications::NotificationEvent::PendingGrant {
+            grant_id: id.clone(),
+            agent_id: agent_id.to_string(),
+            project_name: project_name.to_string(),
+            requested_keys: requested_keys.to_vec(),
+            source_ip,
+        },
+    );
+
+    Ok(PendingGrantOutcome::Pending {
+        grant_id: id,
+        requested_keys: requested_keys.to_vec(),
+        already_pending: false,
+    })
+}
+
+/// Suppress an unused-warning when AUTO_APPROVAL_WINDOW_DAYS isn't referenced
+/// from this module. The admin handler in `admin.rs` is the actual writer.
+const _AUTO_APPROVAL_WINDOW_DAYS: i64 = AUTO_APPROVAL_WINDOW_DAYS;
 
 async fn get_project_by_token(
     state: &AppState,

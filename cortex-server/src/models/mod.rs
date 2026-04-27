@@ -1,7 +1,9 @@
 pub mod agent;
 pub mod audit_log;
+pub mod daemon_session;
 pub mod namespace;
 pub mod notification;
+pub mod pending_grant;
 pub mod policy;
 pub mod project;
 pub mod secret;

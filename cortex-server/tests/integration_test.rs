@@ -99,6 +99,65 @@ async fn register_agent(app: &axum::Router, agent_id: &str, agent_pub: &str) {
     assert_eq!(resp.status(), StatusCode::CREATED, "agent registration must succeed");
 }
 
+/// Perform `/agent/discover`, auto-approving any pending grant so tests do not
+/// need to be aware of the first-access approval flow introduced in #16.
+/// Returns `(final_status, response_body)` — status reflects the result
+/// *after* any approve+retry.
+async fn discover_and_approve(
+    app: &axum::Router,
+    keypair: &AgentKeypair,
+    agent_id: &str,
+    project: &str,
+    file_content: &str,
+    regenerate: bool,
+) -> (StatusCode, Value) {
+    let body_str =
+        discover_body(keypair, agent_id, project, file_content, regenerate).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(body_str))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    if status == StatusCode::FORBIDDEN {
+        let resp_body = body_json(resp.into_body()).await;
+        assert_eq!(
+            resp_body["error_code"].as_str(),
+            Some("pending_approval"),
+            "unexpected 403 from /agent/discover: {}",
+            resp_body
+        );
+        let grant_id = resp_body["details"]["grant_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("pending_approval response missing grant_id: {}", resp_body))
+            .to_string();
+        let approve_req = Request::builder()
+            .method("POST")
+            .uri(&format!("/admin/pending-grants/{}/approve", grant_id))
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from("{}".to_string()))
+            .unwrap();
+        let ar = app.clone().oneshot(approve_req).await.unwrap();
+        assert_eq!(ar.status(), StatusCode::OK, "grant auto-approval must succeed");
+        // Retry with fresh nonce/ts so the signature is valid.
+        let body_str2 =
+            discover_body(keypair, agent_id, project, file_content, regenerate).to_string();
+        let req2 = Request::builder()
+            .method("POST")
+            .uri("/agent/discover")
+            .header("content-type", "application/json")
+            .body(Body::from(body_str2))
+            .unwrap();
+        let resp2 = app.clone().oneshot(req2).await.unwrap();
+        let status2 = resp2.status();
+        return (status2, body_json(resp2.into_body()).await);
+    }
+    (status, body_json(resp.into_body()).await)
+}
+
 /// Creates app with two KEY_VALUE secrets and a default Ed25519-backed agent.
 /// Returns the router plus the agent's keypair so callers can sign auth_proofs.
 async fn setup_app_with_secrets() -> (axum::Router, AgentKeypair) {
@@ -365,25 +424,16 @@ async fn test_create_list_delete_policy() {
 async fn test_discover_full_match() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "movie-translator",
-                "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
+    let (status, body) = discover_and_approve(
+        &app,
+        &keypair,
+        "discover-agent",
+        "movie-translator",
+        "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["full_matched"], true);
     assert!(body["project_token"].as_str().is_some());
     assert!(!body["project_token"].as_str().unwrap().is_empty());
@@ -438,25 +488,16 @@ async fn test_discover_requires_valid_auth() {
 async fn test_discover_partial_match() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "partial-project",
-                "OPENAI_API_KEY=\nMISSING_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
+    let (status, body) = discover_and_approve(
+        &app,
+        &keypair,
+        "discover-agent",
+        "partial-project",
+        "OPENAI_API_KEY=\nMISSING_KEY=",
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["full_matched"], false);
     let unmatched = body["unmatched_keys"].as_array().unwrap();
     assert_eq!(unmatched.len(), 1);
@@ -467,24 +508,15 @@ async fn test_discover_partial_match() {
 async fn test_get_secrets_with_valid_token() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "my-project",
-                "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let discover_body = body_json(resp.into_body()).await;
+    let (_, discover_body) = discover_and_approve(
+        &app,
+        &keypair,
+        "discover-agent",
+        "my-project",
+        "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
+        false,
+    )
+    .await;
     let project_token = discover_body["project_token"].as_str().unwrap().to_string();
 
     let req = Request::builder()
@@ -505,22 +537,8 @@ async fn test_get_secrets_with_valid_token() {
 async fn test_get_secrets_invalid_token() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "guarded-project",
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    discover_and_approve(&app, &keypair, "discover-agent", "guarded-project", "OPENAI_API_KEY=", false)
+        .await;
 
     let req = Request::builder()
         .method("GET")
@@ -556,23 +574,10 @@ async fn test_get_config_template() {
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "mail-project",
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
+    let (_, body) = discover_and_approve(
+        &app, &keypair, "discover-agent", "mail-project", "OPENAI_API_KEY=", false,
+    )
+    .await;
     let token = body["project_token"].as_str().unwrap().to_string();
 
     let req = Request::builder()
@@ -609,14 +614,10 @@ async fn test_discover_conflict_on_rediscover() {
         .to_string()
     };
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(body(false)))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // First discover: auto-approve any pending grant then get initial token.
+    let (first_status, _) =
+        discover_and_approve(&app, &keypair, "discover-agent", "conflict-project", "OPENAI_API_KEY=", false).await;
+    assert_eq!(first_status, StatusCode::OK);
 
     // Second discover of same project without regenerate_token → conflict
     let req = Request::builder()
@@ -679,24 +680,11 @@ async fn test_namespace_isolation() {
     register_agent(&app, "default-agent", &keypair.pub_b64()).await;
 
     // Discover: default-agent should only see "default_secret", not "prod_secret"
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "default-agent",
-                "ns-test",
-                "PROD_SECRET=\nDEFAULT_SECRET=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
+    let (status, body) = discover_and_approve(
+        &app, &keypair, "default-agent", "ns-test", "PROD_SECRET=\nDEFAULT_SECRET=", false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let mapped = body["mapped_keys"].as_object().unwrap();
     assert!(mapped.contains_key("DEFAULT_SECRET"), "should map DEFAULT_SECRET");
     assert!(!mapped.contains_key("PROD_SECRET"), "should NOT map PROD_SECRET from different namespace");
@@ -747,24 +735,11 @@ async fn test_policy_denies_path() {
     register_agent(&app, "policy-agent", &keypair.pub_b64()).await;
 
     // Discover: denied_key should not be mapped
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "policy-agent",
-                "policy-project",
-                "ALLOWED_KEY=\nDENIED_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
+    let (status, body) = discover_and_approve(
+        &app, &keypair, "policy-agent", "policy-project", "ALLOWED_KEY=\nDENIED_KEY=", false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     let mapped = body["mapped_keys"].as_object().unwrap();
     assert!(mapped.contains_key("ALLOWED_KEY"), "allowed_key should be mapped");
     assert!(!mapped.contains_key("DENIED_KEY"), "denied_key should be blocked by policy");
@@ -776,23 +751,9 @@ async fn test_policy_denies_path() {
 async fn test_audit_log_list() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    // Perform a discover to generate an audit log entry
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "audit-project",
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    // Perform a discover to generate an audit log entry.
+    discover_and_approve(&app, &keypair, "discover-agent", "audit-project", "OPENAI_API_KEY=", false)
+        .await;
 
     // List audit logs
     let req = Request::builder()
@@ -816,23 +777,10 @@ async fn test_rotate_key() {
     let (app, keypair) = setup_app_with_secrets().await;
 
     // Discover first to register a project
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "rotate-project",
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
+    let (_, body) = discover_and_approve(
+        &app, &keypair, "discover-agent", "rotate-project", "OPENAI_API_KEY=", false,
+    )
+    .await;
     let project_token = body["project_token"].as_str().unwrap().to_string();
 
     // Rotate KEK with a new operator password.
@@ -872,50 +820,24 @@ async fn discover_for(
     keypair: &AgentKeypair,
     project: &str,
 ) -> (String, String) {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                keypair,
-                "discover-agent",
-                project,
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = body_json(resp.into_body()).await;
-    let token = body["project_token"].as_str().unwrap().to_string();
-    let expires = body["token_expires_at"].as_str().unwrap().to_string();
-    (token, expires)
+    let (status, body) =
+        discover_and_approve(app, keypair, "discover-agent", project, "OPENAI_API_KEY=", false)
+            .await;
+    assert_eq!(status, StatusCode::OK, "discover_for({}) failed: {}", project, body);
+    (
+        body["project_token"].as_str().unwrap().to_string(),
+        body["token_expires_at"].as_str().unwrap().to_string(),
+    )
 }
 
 #[tokio::test]
 async fn test_discover_returns_token_expiration_metadata() {
     let (app, keypair) = setup_app_with_secrets().await;
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "discover-agent",
-                "lifecycle-project",
-                "OPENAI_API_KEY=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
+    let (_, body) = discover_and_approve(
+        &app, &keypair, "discover-agent", "lifecycle-project", "OPENAI_API_KEY=", false,
+    )
+    .await;
 
     assert!(body["token_expires_at"].as_str().is_some());
     // Default TTL: 14 days = 1,209,600 seconds.
@@ -1373,23 +1295,10 @@ async fn test_honey_token_access_revokes_project_token() {
         );
     }
 
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/discover")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            discover_body(
-                &keypair,
-                "honey-agent",
-                "honey-proj",
-                "REAL_KEY=\nFAKE_AWS_ROOT=",
-                false,
-            )
-            .to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let body = body_json(resp.into_body()).await;
+    let (_, body) = discover_and_approve(
+        &app, &keypair, "honey-agent", "honey-proj", "REAL_KEY=\nFAKE_AWS_ROOT=", false,
+    )
+    .await;
     let token = body["project_token"].as_str().unwrap().to_string();
 
     // First read should trigger the honey-token alarm and revoke the token.
@@ -1526,7 +1435,10 @@ async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Sign auth_proof and discover with signed_token=true.
+    // Pre-approve the pending grant for ed-proj so the signed-token discover succeeds.
+    discover_and_approve(&app, &keypair, "ed-agent", "ed-proj", "OPENAI_API_KEY=", false).await;
+
+    // Sign auth_proof and re-discover with signed_token=true + regenerate_token=true.
     let (ts, nonce, auth_proof) = keypair.sign_for("ed-agent");
     let req = Request::builder()
         .method("POST")
@@ -1539,6 +1451,7 @@ async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
                 "ts": ts,
                 "nonce": nonce,
                 "signed_token": true,
+                "regenerate_token": true,
                 "context": {
                     "project_name": "ed-proj",
                     "file_content": "OPENAI_API_KEY=",
