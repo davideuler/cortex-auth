@@ -6,4 +6,5 @@ pub mod notification;
 pub mod pending_grant;
 pub mod policy;
 pub mod project;
+pub mod project_secret_grant;
 pub mod secret;

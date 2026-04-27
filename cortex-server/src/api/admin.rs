@@ -26,6 +26,7 @@ use crate::{
         },
         policy::{CreatePolicyRequest, PolicyDetail},
         project::ProjectListItem,
+        project_secret_grant::{CreateGrantRequest, GrantDetail},
         secret::{CreateSecretRequest, SecretDetail, SecretListItem, UpdateSecretRequest},
     },
     notifications,
@@ -45,6 +46,14 @@ pub fn router() -> Router<AppState> {
         .route("/policies/:id", delete(delete_policy))
         .route("/projects", get(list_projects))
         .route("/projects/:project_name/revoke", post(revoke_project_token))
+        .route(
+            "/projects/:project_name/grants",
+            get(list_project_grants).post(create_project_grant),
+        )
+        .route(
+            "/projects/:project_name/grants/:grant_id",
+            delete(delete_project_grant),
+        )
         .route("/namespaces", get(list_namespaces).post(create_namespace))
         .route("/namespaces/:name", delete(delete_namespace))
         .route("/audit-logs", get(list_audit_logs))
@@ -149,6 +158,28 @@ async fn create_secret(
 
     let namespace = req.namespace.unwrap_or_else(|| "default".to_string());
     ensure_namespace_exists(&state, &namespace).await?;
+
+    // Honey-token collision check: warn if a real (non-honey) secret already
+    // exists with the same key_path in the same namespace. Having both a real
+    // and a honey secret at the same path confuses policy evaluation and
+    // defeats the purpose of the decoy.
+    if req.is_honey_token {
+        let collision: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM secrets WHERE key_path = ? AND namespace = ? AND is_honey_token = 0",
+        )
+        .bind(&req.key_path)
+        .bind(&namespace)
+        .fetch_optional(&state.pool)
+        .await?;
+        if collision.is_some() {
+            return Err(AppError::Conflict(format!(
+                "A real (non-honey) secret at key_path '{}' in namespace '{}' already exists. \
+                 Rename the honey token or delete/rename the real secret first to avoid \
+                 collision. Pass a different key_path to proceed.",
+                req.key_path, namespace
+            )));
+        }
+    }
 
     let id = Uuid::new_v4().to_string();
     let envelope = crypto::seal_envelope(&req.value, &state.kek).map_err(AppError::Internal)?;
@@ -512,7 +543,7 @@ async fn list_projects(
     check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects ORDER BY created_at",
+        "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti FROM projects ORDER BY created_at",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -541,6 +572,23 @@ async fn revoke_project_token(
     Path(project_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     check_admin_token(&headers, &state.admin_token_hash)?;
+
+    // Copy signed token's JTI to per-JTI revocation list so EdDSA JWT
+    // bearers are also blocked before their exp.
+    let jti_row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT signed_token_jti FROM projects WHERE project_name = ?",
+    )
+    .bind(&project_name)
+    .fetch_optional(&state.pool)
+    .await?;
+    if let Some((Some(jti),)) = jti_row {
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO revoked_token_jti (jti, reason) VALUES (?, 'admin_revoke')",
+        )
+        .bind(&jti)
+        .execute(&state.pool)
+        .await;
+    }
 
     let result = sqlx::query(
         "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
@@ -1393,3 +1441,159 @@ async fn list_daemon_sessions(
 }
 
 
+
+// ─── Project-secret grants (#11 ACL) ─────────────────────────────────────
+
+async fn list_project_grants(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_name): Path<String>,
+) -> Result<Json<Vec<GrantDetail>>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let rows: Vec<(String, String, Option<String>, String, String, String)> = sqlx::query_as(
+        "SELECT g.id, s.key_path, g.env_var_name, g.granted_by, g.granted_at, s.namespace \
+         FROM project_secret_grants g \
+         JOIN secrets s ON s.id = g.secret_id \
+         WHERE g.project_name = ? \
+         ORDER BY g.granted_at DESC",
+    )
+    .bind(&project_name)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, key_path, env_var, granted_by, granted_at, ns)| {
+                let env_var_name = env_var
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        key_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&key_path)
+                            .to_uppercase()
+                    });
+                GrantDetail {
+                    id,
+                    project_name: project_name.clone(),
+                    secret_id: String::new(), // omitted from list for brevity
+                    secret_key_path: key_path,
+                    secret_namespace: ns,
+                    env_var_name,
+                    granted_by,
+                    granted_at,
+                }
+            })
+            .collect(),
+    ))
+}
+
+async fn create_project_grant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(project_name): Path<String>,
+    Json(req): Json<CreateGrantRequest>,
+) -> Result<(axum::http::StatusCode, Json<serde_json::Value>), AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    // Verify secret exists.
+    let secret_row: Option<(String, String)> =
+        sqlx::query_as("SELECT id, key_path FROM secrets WHERE id = ?")
+            .bind(&req.secret_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let (secret_id, key_path) = secret_row.ok_or_else(|| {
+        AppError::NotFound(format!("Secret '{}' not found", req.secret_id))
+    })?;
+
+    // Verify project exists.
+    let proj_exists: Option<(String,)> =
+        sqlx::query_as("SELECT project_name FROM projects WHERE project_name = ?")
+            .bind(&project_name)
+            .fetch_optional(&state.pool)
+            .await?;
+    if proj_exists.is_none() {
+        return Err(AppError::NotFound(format!(
+            "Project '{}' not found",
+            project_name
+        )));
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO project_secret_grants (id, project_name, secret_id, env_var_name, granted_by) \
+         VALUES (?, ?, ?, ?, 'admin')",
+    )
+    .bind(&id)
+    .bind(&project_name)
+    .bind(&secret_id)
+    .bind(&req.env_var_name)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint") {
+            AppError::Conflict(format!(
+                "Grant for secret '{}' already exists on project '{}'",
+                secret_id, project_name
+            ))
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    audit::write(
+        &state,
+        None,
+        Some(&project_name),
+        "create_project_grant",
+        Some(&key_path),
+        "success",
+    )
+    .await;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({
+            "id": id,
+            "project_name": project_name,
+            "secret_id": secret_id,
+            "secret_key_path": key_path,
+            "env_var_name": req.env_var_name,
+        })),
+    ))
+}
+
+async fn delete_project_grant(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path((project_name, grant_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    check_admin_token(&headers, &state.admin_token_hash)?;
+
+    let result =
+        sqlx::query("DELETE FROM project_secret_grants WHERE id = ? AND project_name = ?")
+            .bind(&grant_id)
+            .bind(&project_name)
+            .execute(&state.pool)
+            .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!(
+            "Grant '{}' not found on project '{}'",
+            grant_id, project_name
+        )));
+    }
+
+    audit::write(
+        &state,
+        None,
+        Some(&project_name),
+        "delete_project_grant",
+        Some(&grant_id),
+        "success",
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "deleted": true, "id": grant_id })))
+}

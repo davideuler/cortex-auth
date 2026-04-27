@@ -35,8 +35,11 @@ pub fn project_router() -> Router<AppState> {
         .route("/config/:project_name/:app_name", get(get_config))
 }
 
-const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
-const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
+const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, \
+    namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti \
+    FROM projects";
+const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, \
+    kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT_FULL: &str =
     "SELECT id, agent_id, description, namespace, created_at, agent_pub FROM agents";
 
@@ -49,11 +52,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Unauthorized("Missing or invalid Authorization header".into()))
 }
 
-/// Extract caller metadata from optional `X-Cortex-Caller-*` headers. The CLI
-/// is expected to populate these so audit rows record exactly which process
-/// fetched a secret. All fields are advisory — a malicious caller can lie,
-/// but the audit row still pins down the network identity (source IP, agent
-/// session) that signed the request.
+/// Extract caller metadata from optional `X-Cortex-Caller-*` headers.
 fn extract_caller_context(headers: &HeaderMap) -> crate::audit::CallerContext {
     fn h(headers: &HeaderMap, name: &str) -> Option<String> {
         headers
@@ -77,6 +76,15 @@ fn extract_caller_context(headers: &HeaderMap) -> crate::audit::CallerContext {
         hostname: h(headers, "x-cortex-hostname"),
         os: h(headers, "x-cortex-os"),
     }
+}
+
+fn extract_source_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .or_else(|| headers.get("x-real-ip"))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 fn agent_matches_pattern(agent_id: &str, pattern: &str) -> bool {
@@ -125,7 +133,36 @@ fn path_allowed_by_policies(path: &str, matching_policies: &[Policy]) -> bool {
     allowed.iter().any(|pat| path_matches_pattern(path, pat))
 }
 
-/// SQLite-friendly format matching `datetime('now')` output ("YYYY-MM-DD HH:MM:SS").
+/// Returns (policy_name_or_"", allowed) for audit logging.
+fn path_decision_by_policies(path: &str, matching_policies: &[Policy]) -> (String, bool) {
+    if matching_policies.is_empty() {
+        return (String::new(), true);
+    }
+    for p in matching_policies {
+        let denied: Vec<String> =
+            serde_json::from_str(&p.denied_paths).unwrap_or_default();
+        if denied.iter().any(|pat| path_matches_pattern(path, pat)) {
+            return (p.policy_name.clone(), false);
+        }
+    }
+    let has_any_allow = matching_policies.iter().any(|p| {
+        let allowed: Vec<String> =
+            serde_json::from_str(&p.allowed_paths).unwrap_or_default();
+        !allowed.is_empty()
+    });
+    if !has_any_allow {
+        return (String::new(), true);
+    }
+    for p in matching_policies {
+        let allowed: Vec<String> =
+            serde_json::from_str(&p.allowed_paths).unwrap_or_default();
+        if allowed.iter().any(|pat| path_matches_pattern(path, pat)) {
+            return (p.policy_name.clone(), true);
+        }
+    }
+    (String::new(), false)
+}
+
 fn format_sqlite_timestamp(t: chrono::DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
@@ -143,6 +180,17 @@ async fn discover(
     headers: HeaderMap,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
+    // ── Rate limiting: 5 /agent/discover per minute per source IP ────────
+    let source_ip = extract_source_ip(&headers);
+    if !state
+        .rate_limiter
+        .check(&format!("discover:{}", source_ip), 5, 60)
+    {
+        return Err(AppError::TooManyRequests(
+            "Rate limit: 5 /agent/discover requests per minute per IP".into(),
+        ));
+    }
+
     let agent = sqlx::query_as::<_, Agent>(
         &format!("{} WHERE agent_id = ?", AGENT_SELECT_FULL),
     )
@@ -151,9 +199,7 @@ async fn discover(
     .await?
     .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
 
-    // (#13) Ed25519 auth_proof: signature over `ts|nonce|agent_id|/agent/discover`.
-    // Replay protection is by the 5-minute ts window; nonce caching is a
-    // future hardening (see UNCERTAINTIES).
+    // ── Ed25519 auth_proof ────────────────────────────────────────────────
     let ts = req
         .ts
         .ok_or_else(|| AppError::Unauthorized("ts required for auth_proof".into()))?;
@@ -168,8 +214,27 @@ async fn discover(
         ));
     }
     let message = format!("{}|{}|{}|/agent/discover", ts, nonce, req.agent_id);
-    crate::ed25519_keys::verify_agent_signature(&agent.agent_pub, message.as_bytes(), &req.auth_proof)
-        .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
+    crate::ed25519_keys::verify_agent_signature(
+        &agent.agent_pub,
+        message.as_bytes(),
+        &req.auth_proof,
+    )
+    .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
+
+    // ── Nonce replay protection ───────────────────────────────────────────
+    {
+        let cache_key = format!("{}:{}", req.agent_id, nonce);
+        let mut cache = state
+            .nonce_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !cache.check_and_insert(cache_key, ts) {
+            return Err(AppError::Unauthorized(
+                "Nonce replay detected — reuse of (agent_id, nonce) within the 5-minute window"
+                    .into(),
+            ));
+        }
+    }
 
     let agent_id = agent.agent_id.clone();
     let namespace = agent.namespace.clone();
@@ -188,31 +253,89 @@ async fn discover(
         .filter(|p| agent_matches_pattern(&agent_id, &p.agent_pattern))
         .collect();
 
-    let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(
-        &format!(
-            "{} WHERE secret_type = 'KEY_VALUE' AND namespace = ?",
-            SECRET_SELECT_FULL
-        ),
+    // ── Build env_mappings ────────────────────────────────────────────────
+    // Priority: explicit project_secret_grants → fall back to name matching.
+    //
+    // When at least one grant exists for (project_name, namespace), ONLY those
+    // secrets are visible. This eliminates the implicit cross-project exposure
+    // from env-name normalization (DESIGN: explicit ACL).
+    //
+    // When no grants exist (new project or pre-migration), the legacy
+    // name-matching path runs so existing integrations keep working.
+
+    let grant_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT s.key_path, g.env_var_name \
+         FROM project_secret_grants g \
+         JOIN secrets s ON s.id = g.secret_id \
+         WHERE g.project_name = ? AND s.namespace = ?",
     )
+    .bind(project_name)
     .bind(&namespace)
     .fetch_all(&state.pool)
     .await?;
 
-    let secret_map: HashMap<String, String> = secrets
-        .iter()
-        .filter(|s| path_allowed_by_policies(&s.key_path, &matching_policies))
-        .map(|s| (s.key_path.to_lowercase().replace('/', "_"), s.key_path.clone()))
-        .collect();
-
     let mut mapped_keys: HashMap<String, String> = HashMap::new();
     let mut unmatched: Vec<String> = Vec::new();
 
-    for env_key in &env_keys {
-        let normalized = env_key.to_lowercase();
-        if let Some(secret_path) = secret_map.get(&normalized) {
-            mapped_keys.insert(env_key.clone(), secret_path.clone());
-        } else {
-            unmatched.push(env_key.clone());
+    if !grant_rows.is_empty() {
+        // Grant-based mapping: only explicitly granted secrets are accessible.
+        let grant_map: HashMap<String, String> = grant_rows
+            .iter()
+            .map(|(key_path, env_var)| {
+                let var = env_var
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_uppercase())
+                    .unwrap_or_else(|| {
+                        key_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(key_path.as_str())
+                            .to_uppercase()
+                    });
+                (var, key_path.clone())
+            })
+            .collect();
+
+        for env_key in &env_keys {
+            // Case-insensitive lookup against grant_map keys.
+            let upper = env_key.to_uppercase();
+            if let Some(secret_path) = grant_map.get(&upper) {
+                // Apply policy filter.
+                if path_allowed_by_policies(secret_path, &matching_policies) {
+                    mapped_keys.insert(env_key.clone(), secret_path.clone());
+                } else {
+                    unmatched.push(env_key.clone());
+                }
+            } else {
+                unmatched.push(env_key.clone());
+            }
+        }
+    } else {
+        // Legacy name-based matching (backward compat).
+        let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(
+            &format!(
+                "{} WHERE secret_type = 'KEY_VALUE' AND namespace = ?",
+                SECRET_SELECT_FULL
+            ),
+        )
+        .bind(&namespace)
+        .fetch_all(&state.pool)
+        .await?;
+
+        let secret_map: HashMap<String, String> = secrets
+            .iter()
+            .filter(|s| path_allowed_by_policies(&s.key_path, &matching_policies))
+            .map(|s| (s.key_path.to_lowercase().replace('/', "_"), s.key_path.clone()))
+            .collect();
+
+        for env_key in &env_keys {
+            let normalized = env_key.to_lowercase();
+            if let Some(secret_path) = secret_map.get(&normalized) {
+                mapped_keys.insert(env_key.clone(), secret_path.clone());
+            } else {
+                unmatched.push(env_key.clone());
+            }
         }
     }
 
@@ -229,9 +352,6 @@ async fn discover(
     let expires_at = now + Duration::minutes(DEFAULT_TOKEN_TTL_MINUTES);
     let expires_at_str = format_sqlite_timestamp(expires_at);
 
-    // Scope = the set of secret key_paths this token will be allowed to read.
-    // Frozen at discover time so re-issuing with new env_mappings cannot
-    // implicitly broaden access without going through discover again.
     let scope_paths: Vec<String> = {
         let mut v: Vec<String> = mapped_keys.values().cloned().collect();
         v.sort();
@@ -240,15 +360,9 @@ async fn discover(
     };
     let scope_json = serde_json::to_string(&scope_paths).unwrap();
 
-    // First-access human approval (UNCERTAINTIES #16). Only gate when the
-    // requested scope is non-empty — an empty .env file produces an empty
-    // scope and there is nothing to gate.
+    // ── First-access human approval ───────────────────────────────────────
     if !scope_paths.is_empty() {
-        let source_ip = headers
-            .get("x-forwarded-for")
-            .or_else(|| headers.get("x-real-ip"))
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+        let source_ip_opt = Some(source_ip.clone()).filter(|s| s != "unknown");
 
         match check_or_create_pending_grant(
             &state,
@@ -256,13 +370,11 @@ async fn discover(
             project_name,
             &namespace,
             &scope_paths,
-            source_ip,
+            source_ip_opt,
         )
         .await?
         {
-            PendingGrantOutcome::Approved => {
-                // continue — token issuance below.
-            }
+            PendingGrantOutcome::Approved => {}
             PendingGrantOutcome::Pending {
                 grant_id,
                 requested_keys,
@@ -309,15 +421,15 @@ async fn discover(
                 .await;
                 return Err(AppError::Forbidden {
                     code: "grant_denied",
-                    message: "Access for this (agent, project) was explicitly denied by an \
-                              administrator. Contact your operator if you believe this is in \
-                              error."
-                        .into(),
+                    message: "Access for this (agent, project) was explicitly denied.".into(),
                     details: None,
                 });
             }
         }
     }
+
+    // ── Issue / rotate project token ──────────────────────────────────────
+    let new_jti = Uuid::new_v4().to_string();
 
     let project_token = if let Some(existing_proj) = &existing {
         let status = existing_proj.token_status();
@@ -329,13 +441,16 @@ async fn discover(
             let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
             sqlx::query(
-                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, scope = ?, token_expires_at = ?, token_revoked_at = NULL, updated_at = datetime('now') WHERE project_name = ?",
+                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, \
+                 scope = ?, token_expires_at = ?, token_revoked_at = NULL, signed_token_jti = ?, \
+                 updated_at = datetime('now') WHERE project_name = ?",
             )
             .bind(&hash)
             .bind(&mappings_json)
             .bind(&namespace)
             .bind(&scope_json)
             .bind(&expires_at_str)
+            .bind(&new_jti)
             .bind(project_name)
             .execute(&state.pool)
             .await?;
@@ -357,7 +472,8 @@ async fn discover(
             token
         } else {
             return Err(AppError::Conflict(
-                "Project already registered with an active token. Pass regenerate_token=true to rotate, or wait for it to expire."
+                "Project already registered with an active token. Pass regenerate_token=true \
+                 to rotate, or wait for it to expire."
                     .into(),
             ));
         }
@@ -368,7 +484,8 @@ async fn discover(
         let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
         sqlx::query(
-            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, namespace, scope, token_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, \
+             namespace, scope, token_expires_at, signed_token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(project_name)
@@ -377,6 +494,7 @@ async fn discover(
         .bind(&namespace)
         .bind(&scope_json)
         .bind(&expires_at_str)
+        .bind(&new_jti)
         .execute(&state.pool)
         .await?;
 
@@ -400,7 +518,7 @@ async fn discover(
             "aud": "cortex-cli",
             "iat": Utc::now().timestamp(),
             "exp": expires_at.timestamp(),
-            "jti": Uuid::new_v4().to_string(),
+            "jti": new_jti,
             "scope": scope_paths,
             "namespace": namespace,
             "project_id": project_name,
@@ -436,10 +554,6 @@ enum PendingGrantOutcome {
     Denied,
 }
 
-/// Decide whether the supplied `(agent_id, project_name, namespace, scope)`
-/// is already covered by an approved `pending_grants` row, or needs human
-/// review. When a fresh review is needed, inserts a `pending` row and fires
-/// an outbound notification so the operator dashboard pings.
 async fn check_or_create_pending_grant(
     state: &AppState,
     agent_id: &str,
@@ -461,12 +575,10 @@ async fn check_or_create_pending_grant(
     .fetch_all(&state.pool)
     .await?;
 
-    // Any approved + still-in-window grant whose approved_keys ⊇ requested → pass.
     if existing.iter().any(|g| g.covers(requested_keys)) {
         return Ok(PendingGrantOutcome::Approved);
     }
 
-    // Any non-expired denial (decided_by an admin) → block.
     if existing
         .iter()
         .any(|g| g.status == "denied" && g.decided_at.is_some())
@@ -474,7 +586,6 @@ async fn check_or_create_pending_grant(
         return Ok(PendingGrantOutcome::Denied);
     }
 
-    // Existing pending row → don't spam, return its id.
     if let Some(pending) = existing.iter().find(|g| g.status == "pending") {
         return Ok(PendingGrantOutcome::Pending {
             grant_id: pending.id.clone(),
@@ -483,7 +594,6 @@ async fn check_or_create_pending_grant(
         });
     }
 
-    // No covering grant → insert a fresh pending row and notify.
     let id = Uuid::new_v4().to_string();
     let requested_json = serde_json::to_string(requested_keys).unwrap_or_else(|_| "[]".into());
     sqlx::query(
@@ -518,8 +628,6 @@ async fn check_or_create_pending_grant(
     })
 }
 
-/// Suppress an unused-warning when AUTO_APPROVAL_WINDOW_DAYS isn't referenced
-/// from this module. The admin handler in `admin.rs` is the actual writer.
 const _AUTO_APPROVAL_WINDOW_DAYS: i64 = AUTO_APPROVAL_WINDOW_DAYS;
 
 async fn get_project_by_token(
@@ -535,13 +643,9 @@ async fn get_project_by_token(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", project_name)))?;
 
-    // (#14) Tokens with three dot-separated segments are EdDSA JWTs minted
-    // by /agent/discover when the caller passed `signed_token: true`. Legacy
-    // hex-encoded random tokens go through the SHA-256 hash compare path.
     let token_ok = if token.matches('.').count() == 2 {
         match crate::ed25519_keys::verify_jwt::<serde_json::Value>(&state.server_keypair, token) {
             Ok(claims) => {
-                // Check exp + jti revocation.
                 let exp = claims.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
                 if exp != 0 && exp < Utc::now().timestamp() {
                     return Err(AppError::token_expired());
@@ -609,7 +713,38 @@ async fn get_secrets(
 ) -> Result<Json<SecretsResponse>, AppError> {
     let token = extract_bearer_token(&headers)?;
     let caller = extract_caller_context(&headers);
+
+    // ── Optional body-replay protection ──────────────────────────────────
+    // When CORTEX_REQUIRE_REQUEST_SIGNING=1 the request must carry a valid
+    // X-Daemon-Attestation header (same format as /daemon/attest uses).
+    if state.config.require_request_signing {
+        crate::api::daemon::verify_attestation_header(
+            &state,
+            &headers,
+            "GET",
+            &format!("/project/secrets/{}", project_name),
+            &[],
+        )
+        .await?;
+    }
+
     let project = get_project_by_token(&state, &project_name, &token).await?;
+
+    // ── Load policies keyed to the project_name ───────────────────────────
+    // Policies are evaluated per-path on every fetch so access can be
+    // tightened without waiting for the next discover cycle.
+    let all_policies = sqlx::query_as::<_, Policy>(
+        "SELECT id, policy_name, agent_pattern, allowed_paths, denied_paths, created_at \
+         FROM policies",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    // Match policies against project_name as the subject identifier.
+    let matching_policies: Vec<Policy> = all_policies
+        .into_iter()
+        .filter(|p| agent_matches_pattern(&project_name, &p.agent_pattern))
+        .collect();
 
     let mappings = project.get_env_mappings();
     let scope = project.get_scope();
@@ -618,10 +753,35 @@ async fn get_secrets(
     let mut env_vars: HashMap<String, String> = HashMap::new();
 
     for (env_var, secret_path) in &mappings {
-        // Enforce the frozen-at-discover scope. Empty scope means "legacy
-        // project predating the scope column" — fall back to env_mappings.
         if !scope_set.is_empty() && !scope_set.contains(secret_path.as_str()) {
             continue;
+        }
+
+        // ── Per-path policy evaluation with audit ─────────────────────
+        let (policy_name, allowed) =
+            path_decision_by_policies(secret_path, &matching_policies);
+        if !allowed {
+            audit::write(
+                &state,
+                None,
+                Some(&project_name),
+                "policy_decision",
+                Some(secret_path),
+                &format!("denied:policy={}", policy_name),
+            )
+            .await;
+            continue;
+        }
+        if !policy_name.is_empty() {
+            audit::write(
+                &state,
+                None,
+                Some(&project_name),
+                "policy_decision",
+                Some(secret_path),
+                &format!("allowed:policy={}", policy_name),
+            )
+            .await;
         }
 
         let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
@@ -644,9 +804,7 @@ async fn get_secrets(
                     caller.source_ip.clone(),
                 )
                 .await;
-                return Err(AppError::Unauthorized(
-                    "Secret access denied".into(),
-                ));
+                return Err(AppError::Unauthorized("Secret access denied".into()));
             }
             if let Some(val) = open_secret_value(&state, &s) {
                 env_vars.insert(env_var.clone(), val);
@@ -668,13 +826,6 @@ async fn get_secrets(
     Ok(Json(SecretsResponse { env_vars }))
 }
 
-/// Honey-tokens are decoy secrets that should never be retrieved by a
-/// legitimate caller. Reading one is a 100% attack signal: we revoke the
-/// project's token immediately, write a high-priority alarm to the audit
-/// log, and dispatch outbound notifications to every configured channel
-/// (email via himalaya-cli, Slack/Telegram/Discord webhooks). The response
-/// to the caller is a generic 401 so they cannot tell whether the secret
-/// exists or is a decoy.
 async fn trigger_honey_token_alarm(
     state: &AppState,
     project_name: &str,
@@ -682,7 +833,8 @@ async fn trigger_honey_token_alarm(
     source_ip: Option<String>,
 ) {
     let _ = sqlx::query(
-        "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
+        "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') \
+         WHERE project_name = ? AND token_revoked_at IS NULL",
     )
     .bind(project_name)
     .execute(&state.pool)
@@ -721,6 +873,18 @@ async fn get_config(
 ) -> Result<String, AppError> {
     let token = extract_bearer_token(&headers)?;
     let caller = extract_caller_context(&headers);
+
+    if state.config.require_request_signing {
+        crate::api::daemon::verify_attestation_header(
+            &state,
+            &headers,
+            "GET",
+            &format!("/project/config/{}/{}", project_name, app_name),
+            &[],
+        )
+        .await?;
+    }
+
     let project = get_project_by_token(&state, &project_name, &token).await?;
 
     let template_secret = sqlx::query_as::<_, crate::models::secret::Secret>(
@@ -797,11 +961,8 @@ async fn get_config(
     Ok(rendered)
 }
 
-// ─── #14: JWKS endpoint ──────────────────────────────────────────────────
+// ─── JWKS endpoint ─────────────────────────────────────────────────────────
 
-/// `GET /.well-known/jwks.json` exposes every server public key by `kid` so
-/// downstream services can verify EdDSA-signed project tokens (#14) across
-/// key rotations.
 pub async fn jwks(
     State(state): State<AppState>,
 ) -> Result<Json<crate::ed25519_keys::JwkSet>, AppError> {
@@ -811,28 +972,26 @@ pub async fn jwks(
     Ok(Json(set))
 }
 
-// ─── #16: Device Authorization Grant (RFC 8628) ─────────────────────────
+// ─── Device Authorization Grant (RFC 8628) ─────────────────────────────────
 
 #[derive(serde::Deserialize)]
 pub struct DeviceAuthorizeRequest {
-    /// Optional client identifier — useful for the dashboard's pending-device
-    /// list. Free-form; not authenticated at this stage.
     pub client_id: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct DeviceAuthorizeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: i64,
-    interval: i64,
 }
 
 pub async fn device_authorize(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(_req): Json<DeviceAuthorizeRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Rate limit: 1 /device/authorize per minute per IP.
+    let ip = extract_source_ip(&headers);
+    if !state.rate_limiter.check(&format!("device_authorize:{}", ip), 1, 60) {
+        return Err(AppError::TooManyRequests(
+            "Rate limit: 1 /device/authorize per minute per IP".into(),
+        ));
+    }
+
     let device_code = crypto::generate_token();
     let user_code = generate_user_code();
     let id = Uuid::new_v4().to_string();
@@ -849,6 +1008,15 @@ pub async fn device_authorize(
     .bind(&expires_str)
     .execute(&state.pool)
     .await?;
+
+    #[derive(serde::Serialize)]
+    struct DeviceAuthorizeResponse {
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: i64,
+        interval: i64,
+    }
 
     let resp = DeviceAuthorizeResponse {
         device_code,
@@ -870,8 +1038,19 @@ pub struct DeviceTokenRequest {
 
 pub async fn device_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<DeviceTokenRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Rate limit: 5 /device/token polls per minute per device_code.
+    let rl_key = format!("device_token:{}", &req.device_code[..req.device_code.len().min(16)]);
+    if !state.rate_limiter.check(&rl_key, 5, 60) {
+        return Err(AppError::TooManyRequests(
+            "Rate limit: 5 /device/token polls per minute per device_code".into(),
+        ));
+    }
+
+    let _ = headers; // headers available for future use
+
     let row: Option<(String, Option<String>, String)> = sqlx::query_as(
         "SELECT status, agent_id, expires_at FROM pending_devices WHERE device_code = ?",
     )
@@ -895,8 +1074,9 @@ pub async fn device_token(
         }),
         "denied" => Err(AppError::Unauthorized("Approval denied".into())),
         "approved" => {
-            let agent_id =
-                agent_id.ok_or_else(|| AppError::Internal(anyhow::anyhow!("approved row has no agent_id")))?;
+            let agent_id = agent_id.ok_or_else(|| {
+                AppError::Internal(anyhow::anyhow!("approved row has no agent_id"))
+            })?;
             let claims = serde_json::json!({
                 "iss": "cortex-auth",
                 "sub": agent_id,
@@ -909,7 +1089,15 @@ pub async fn device_token(
             let access_token = crate::ed25519_keys::sign_jwt(&state.server_keypair, &claims)
                 .map_err(AppError::Internal)?;
 
-            audit::write(&state, Some(&agent_id), None, "device_token_issue", None, "success").await;
+            audit::write(
+                &state,
+                Some(&agent_id),
+                None,
+                "device_token_issue",
+                None,
+                "success",
+            )
+            .await;
 
             Ok(Json(serde_json::json!({
                 "access_token": access_token,

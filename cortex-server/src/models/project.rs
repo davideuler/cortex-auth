@@ -22,6 +22,9 @@ pub struct Project {
     pub updated_at: String,
     pub token_expires_at: Option<String>,
     pub token_revoked_at: Option<String>,
+    /// JTI of the most recently issued signed EdDSA project token. Written at
+    /// discover time; copied to `revoked_token_jti` when the token is revoked.
+    pub signed_token_jti: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

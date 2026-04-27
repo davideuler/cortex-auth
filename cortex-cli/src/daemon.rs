@@ -42,6 +42,8 @@ struct AttestCtx {
     agent_id: String,
     /// Agent Ed25519 signing key (loaded from ~/.cortex/agent-<id>.key).
     agent_key: SigningKey,
+    /// SHA-256 of this binary — sent as X-Cortex-Caller-Binary-Sha256.
+    binary_sha256: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -113,6 +115,7 @@ async fn main() -> Result<()> {
         server_url,
         agent_id,
         agent_key,
+        binary_sha256,
     });
 
     let cache: TokenCache = Arc::new(RwLock::new(load_token_cache()));
@@ -381,11 +384,15 @@ async fn discover_token_attested(
     let attest = make_attestation_header(ctx, "POST", "/agent/discover", &body_bytes);
 
     let url = format!("{}/agent/discover", ctx.server_url);
-    let resp = client
+    let mut req = client
         .post(&url)
         .header("X-Daemon-Attestation", attest)
         .header("Content-Type", "application/json")
-        .body(body_bytes)
+        .body(body_bytes);
+    for (k, v) in build_caller_headers(ctx) {
+        req = req.header(k, v);
+    }
+    let resp = req
         .send()
         .await
         .context("POST /agent/discover failed")
@@ -459,13 +466,14 @@ async fn fetch_secrets_attested(
     let url = format!("{}{}", ctx.server_url, path);
     let attest = make_attestation_header(ctx, "GET", &path, b"");
 
-    let resp = client
+    let mut req = client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .header("X-Daemon-Attestation", attest)
-        .send()
-        .await
-        .context("GET /project/secrets failed")?;
+        .header("X-Daemon-Attestation", attest);
+    for (k, v) in build_caller_headers(ctx) {
+        req = req.header(k, v);
+    }
+    let resp = req.send().await.context("GET /project/secrets failed")?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -478,6 +486,50 @@ async fn fetch_secrets_attested(
         .await
         .context("parse /project/secrets response")?;
     Ok(body.env_vars)
+}
+
+// ── Caller-context headers ───────────────────────────────────────────────────
+
+/// Build the X-Cortex-Caller-* header map for audit enrichment.
+/// All fields are advisory (server treats them as best-effort telemetry).
+fn build_caller_headers(ctx: &AttestCtx) -> Vec<(&'static str, String)> {
+    let mut hdrs: Vec<(&'static str, String)> = Vec::new();
+
+    hdrs.push(("x-cortex-caller-pid", std::process::id().to_string()));
+    hdrs.push(("x-cortex-caller-binary-sha256", ctx.binary_sha256.clone()));
+
+    // SHA-256 of all CLI argv joined by NUL bytes.
+    let argv: Vec<String> = std::env::args().collect();
+    let argv_joined = argv.join("\0");
+    let argv_hash = hex::encode(Sha256::digest(argv_joined.as_bytes()));
+    hdrs.push(("x-cortex-caller-argv-hash", argv_hash));
+
+    if let Ok(cwd) = std::env::current_dir() {
+        hdrs.push(("x-cortex-caller-cwd", cwd.display().to_string()));
+    }
+
+    // Best-effort: git HEAD of the working directory.
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        if out.status.success() {
+            let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !head.is_empty() {
+                hdrs.push(("x-cortex-caller-git-commit", head));
+            }
+        }
+    }
+
+    hdrs.push(("x-cortex-hostname", get_hostname()));
+
+    // OS identifier + architecture.
+    hdrs.push((
+        "x-cortex-os",
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    ));
+
+    hdrs
 }
 
 // ── Attestation helpers ──────────────────────────────────────────────────────

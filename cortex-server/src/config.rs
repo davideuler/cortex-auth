@@ -6,6 +6,17 @@ pub struct AppConfig {
     pub port: u16,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    /// When true the server binds plain HTTP even without TLS certificates.
+    /// Set INSECURE_HTTP=1 (or true/yes). Without this flag the server refuses
+    /// to start unless TLS_CERT_FILE + TLS_KEY_FILE are both provided.
+    pub insecure_http: bool,
+    /// Allowed CORS origins for the dashboard. Comma-separated list of exact
+    /// origins (e.g. "https://admin.example.com,https://dash.example.com").
+    /// Defaults to same-origin only (empty = deny all cross-origin requests).
+    pub dashboard_origins: Vec<String>,
+    /// When true /project/* endpoints require a valid X-Daemon-Attestation
+    /// header (daemon Ed25519 request signing). Set CORTEX_REQUIRE_REQUEST_SIGNING=1.
+    pub require_request_signing: bool,
 }
 
 impl AppConfig {
@@ -21,11 +32,33 @@ impl AppConfig {
         let tls_cert_file = std::env::var("TLS_CERT_FILE").ok();
         let tls_key_file = std::env::var("TLS_KEY_FILE").ok();
 
+        let insecure_http = matches!(
+            std::env::var("INSECURE_HTTP").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes")
+        );
+
+        let dashboard_origins = std::env::var("CORTEX_DASHBOARD_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let require_request_signing = matches!(
+            std::env::var("CORTEX_REQUIRE_REQUEST_SIGNING")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("yes")
+        );
+
         Ok(AppConfig {
             database_url,
             port,
             tls_cert_file,
             tls_key_file,
+            insecure_http,
+            dashboard_origins,
+            require_request_signing,
         })
     }
 
@@ -35,6 +68,9 @@ impl AppConfig {
             port: 3000,
             tls_cert_file: None,
             tls_key_file: None,
+            insecure_http: true,
+            dashboard_origins: vec![],
+            require_request_signing: false,
         }
     }
 }

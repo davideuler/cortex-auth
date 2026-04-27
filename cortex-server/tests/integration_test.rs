@@ -1085,6 +1085,7 @@ async fn test_token_status_helper() {
                 .to_string(),
         ),
         token_revoked_at: None,
+        signed_token_jti: None,
     };
     assert_eq!(p.token_status(), "active");
 
@@ -1703,4 +1704,304 @@ async fn test_device_authorize_flow() {
     let token = body["access_token"].as_str().unwrap();
     assert_eq!(token.matches('.').count(), 2, "access token must be a JWT");
     assert_eq!(body["token_type"], "Bearer");
+}
+
+// ─── New security feature tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_nonce_replay_rejected() {
+    let app = setup_test_app().await;
+    let kp = AgentKeypair::new();
+    register_agent(&app, "nonce-agent", &kp.pub_b64()).await;
+
+    // Build a discover body, capture the ts/nonce, then re-use them.
+    let ts = chrono::Utc::now().timestamp();
+    let nonce = "deadbeefcafe0000";
+    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, "nonce-agent");
+    use ed25519_dalek::Signer;
+    let sig = kp.signing.sign(message.as_bytes());
+    use base64::Engine;
+    let auth_proof = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+
+    let body = json!({
+        "agent_id": "nonce-agent",
+        "auth_proof": auth_proof,
+        "ts": ts,
+        "nonce": nonce,
+        "context": {"project_name": "replay-test", "file_content": ""},
+    });
+
+    // First call succeeds.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    // Expected: 403 pending_approval (no pending grant yet) or 200/200-ish, NOT 401 replay.
+    assert_ne!(resp.status(), StatusCode::UNAUTHORIZED, "first use should not be a replay error");
+
+    // Second call with same ts+nonce must be rejected as replay.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "replay nonce must be rejected");
+    let b = body_json(resp.into_body()).await;
+    assert!(b["error"].as_str().unwrap().contains("replay"), "error must mention replay");
+}
+
+#[tokio::test]
+async fn test_rate_limit_device_authorize() {
+    let app = setup_test_app().await;
+
+    // Hit /device/authorize 2 times — limit is 1/min for this route.
+    let make_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/device/authorize")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"client_id": "test"}).to_string()))
+            .unwrap()
+    };
+
+    let r1 = app.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::OK, "first request should succeed");
+
+    let r2 = app.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS, "second request should be rate-limited");
+}
+
+#[tokio::test]
+async fn test_honey_token_collision_rejected() {
+    let app = setup_test_app().await;
+
+    // Create a real secret at /prod/api_key in default namespace.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({
+            "key_path": "/prod/collision_key",
+            "secret_type": "KEY_VALUE",
+            "value": "real-value",
+            "namespace": "default",
+            "is_honey_token": false,
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Try to create a honey token at the same path → must be rejected.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({
+            "key_path": "/prod/collision_key",
+            "secret_type": "KEY_VALUE",
+            "value": "honey-value",
+            "namespace": "default",
+            "is_honey_token": true,
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "honey token must not shadow real secret");
+    let b = body_json(resp.into_body()).await;
+    assert!(b["error"].as_str().unwrap().to_lowercase().contains("collision")
+        || b["error"].as_str().unwrap().to_lowercase().contains("exists"),
+        "error must explain the collision");
+}
+
+#[tokio::test]
+async fn test_project_secret_grants_crud() {
+    let app = setup_test_app().await;
+
+    // Create a project first (via discover).
+    let kp = AgentKeypair::new();
+    register_agent(&app, "grants-agent", &kp.pub_b64()).await;
+
+    // Create a secret.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({
+            "key_path": "/grants/mykey",
+            "secret_type": "KEY_VALUE",
+            "value": "secret-value",
+            "namespace": "default",
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let b = body_json(resp.into_body()).await;
+    let secret_id = b["id"].as_str().unwrap().to_string();
+
+    // Register the project via discover.
+    let body = discover_body(&kp, "grants-agent", "grants-proj", "MYKEY=\n", false);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    // Approve the pending grant if first-access gating fires.
+    if resp.status() == StatusCode::FORBIDDEN {
+        let b = body_json(resp.into_body()).await;
+        let pg_id = b["details"]["grant_id"].as_str().unwrap().to_string();
+        let approve_req = Request::builder()
+            .method("POST")
+            .uri(format!("/admin/pending-grants/{}/approve", pg_id))
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from("{}"))
+            .unwrap();
+        app.clone().oneshot(approve_req).await.unwrap();
+    }
+
+    // Create an explicit project-secret grant.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/grants-proj/grants")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({
+            "secret_id": secret_id,
+            "env_var_name": "MY_SECRET",
+        }).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "grant creation must succeed");
+    let b = body_json(resp.into_body()).await;
+    let grant_id = b["id"].as_str().unwrap().to_string();
+
+    // List grants.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/projects/grants-proj/grants")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b = body_json(resp.into_body()).await;
+    let grants = b.as_array().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0]["env_var_name"], "MY_SECRET");
+
+    // Delete the grant.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/admin/projects/grants-proj/grants/{}", grant_id))
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify it's gone.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/projects/grants-proj/grants")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let b = body_json(resp.into_body()).await;
+    assert_eq!(b.as_array().unwrap().len(), 0, "grant list must be empty after delete");
+}
+
+#[tokio::test]
+async fn test_jti_revocation_blocks_signed_token() {
+    let app = setup_test_app().await;
+    let kp = AgentKeypair::new();
+    register_agent(&app, "jti-agent", &kp.pub_b64()).await;
+
+    // Create secret + discover + approve.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({
+            "key_path": "/jti/key",
+            "secret_type": "KEY_VALUE",
+            "value": "jti-value",
+            "namespace": "default",
+        }).to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let mut body = discover_body(&kp, "jti-agent", "jti-proj", "KEY=\n", false);
+    body["signed_token"] = json!(true);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let (status, b) = (resp.status(), body_json(resp.into_body()).await);
+
+    let signed_token = if status == StatusCode::FORBIDDEN {
+        let pg_id = b["details"]["grant_id"].as_str().unwrap().to_string();
+        let approve_req = Request::builder()
+            .method("POST")
+            .uri(format!("/admin/pending-grants/{}/approve", pg_id))
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from("{}"))
+            .unwrap();
+        app.clone().oneshot(approve_req).await.unwrap();
+        let mut body = discover_body(&kp, "jti-agent", "jti-proj", "KEY=\n", true);
+        body["signed_token"] = json!(true);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent/discover")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let b = body_json(resp.into_body()).await;
+        b["signed_project_token"].as_str().unwrap().to_string()
+    } else {
+        b["signed_project_token"].as_str().unwrap_or("").to_string()
+    };
+
+    if signed_token.is_empty() {
+        return; // No signed token issued, skip rest.
+    }
+
+    // Revoke the project token.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/projects/jti-proj/revoke")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The signed token should now be rejected by jti check.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/jti-proj")
+        .header("authorization", format!("Bearer {}", signed_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.status() == StatusCode::UNAUTHORIZED || resp.status().as_u16() == 401,
+        "revoked signed token must be rejected"
+    );
 }

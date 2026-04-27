@@ -28,9 +28,17 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
 
-    // Server boots in SEALED state. We open the DB to read the KEK sentinel
-    // before opening the public listener — if the operator password is wrong
-    // the process exits without ever binding :3000.
+    // TLS enforcement: refuse to start without TLS unless INSECURE_HTTP=1 is
+    // explicitly set. This prevents accidental plaintext deployments.
+    let has_tls = config.tls_cert_file.is_some() && config.tls_key_file.is_some();
+    if !has_tls && !config.insecure_http {
+        anyhow::bail!(
+            "CortexAuth refuses to start without TLS.\n\
+             Supply TLS_CERT_FILE + TLS_KEY_FILE, or set INSECURE_HTTP=1 to \
+             allow plain HTTP (only for local development)."
+        );
+    }
+
     let pool = db::create_pool(&config.database_url).await?;
     db::run_migrations(&pool).await?;
 
@@ -77,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Daily cleanup: remove audit logs older than 60 days
+    // Daily audit-log cleanup (entries older than 60 days).
     let cleanup_pool = pool.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(86400));
@@ -104,6 +112,18 @@ async fn main() -> anyhow::Result<()> {
         admin.hash,
     );
 
+    // Hourly rate-limiter cleanup.
+    {
+        let rl = state.rate_limiter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                rl.cleanup(3600);
+            }
+        });
+    }
+
     if recovery_mode {
         cortex_server::audit::write(&state, None, None, "recovery_boot", None, "alarm").await;
         notifications::dispatch(
@@ -120,7 +140,10 @@ async fn main() -> anyhow::Result<()> {
     if let (Some(cert_file), Some(key_file)) = (&config.tls_cert_file, &config.tls_key_file) {
         serve_tls(app, addr, cert_file, key_file).await?;
     } else {
-        tracing::info!("CortexAuth server listening on http://{}", addr);
+        tracing::warn!(
+            "CortexAuth server listening on http://{} [INSECURE — no TLS]",
+            addr
+        );
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
     }
@@ -141,14 +164,18 @@ async fn serve_tls(
     use tokio_rustls::TlsAcceptor;
     use tower::Service;
 
-    let cert_bytes = std::fs::read(cert_file)?;
-    let key_bytes = std::fs::read(key_file)?;
+    let cert_bytes = std::fs::read(cert_file)
+        .map_err(|e| anyhow::anyhow!("Cannot read TLS_CERT_FILE '{}': {}", cert_file, e))?;
+    let key_bytes = std::fs::read(key_file)
+        .map_err(|e| anyhow::anyhow!("Cannot read TLS_KEY_FILE '{}': {}", key_file, e))?;
 
     let certs: Vec<Certificate> = rustls_pemfile::certs(&mut cert_bytes.as_ref())
         .map_err(|e| anyhow::anyhow!("cert parse error: {}", e))?
         .into_iter()
         .map(Certificate)
         .collect();
+
+    anyhow::ensure!(!certs.is_empty(), "No certificates found in {}", cert_file);
 
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_bytes.as_ref())
         .map_err(|e| anyhow::anyhow!("key parse error: {}", e))?;
