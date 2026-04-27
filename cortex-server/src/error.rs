@@ -1,5 +1,5 @@
 use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
-use serde_json::json;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -11,6 +11,16 @@ pub enum AppError {
     /// tokens from generic auth failures and trigger auto-rotation.
     #[error("Token error ({code}): {message}")]
     TokenError { code: &'static str, message: String },
+
+    /// 403 with a structured `error_code` and an optional details payload —
+    /// used by `/agent/discover` to return `pending_approval` when a grant
+    /// is awaiting human review.
+    #[error("Forbidden ({code}): {message}")]
+    Forbidden {
+        code: &'static str,
+        message: String,
+        details: Option<Value>,
+    },
 
     #[error("Not found: {0}")]
     NotFound(String),
@@ -52,6 +62,13 @@ impl IntoResponse for AppError {
                 Json(json!({ "error": message, "error_code": code })),
             )
                 .into_response(),
+            AppError::Forbidden { code, message, details } => {
+                let mut body = json!({ "error": message, "error_code": code });
+                if let Some(d) = details {
+                    body["details"] = d;
+                }
+                (StatusCode::FORBIDDEN, Json(body)).into_response()
+            }
             other => {
                 let (status, message) = match &other {
                     AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
@@ -66,7 +83,7 @@ impl IntoResponse for AppError {
                         tracing::error!("Database error: {:?}", e);
                         (StatusCode::INTERNAL_SERVER_ERROR, "Database error".to_string())
                     }
-                    AppError::TokenError { .. } => unreachable!(),
+                    AppError::TokenError { .. } | AppError::Forbidden { .. } => unreachable!(),
                 };
                 (status, Json(json!({ "error": message }))).into_response()
             }

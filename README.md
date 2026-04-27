@@ -21,12 +21,13 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
   │                Agent              │                        │
   │         (autonomous pipeline)     │                        │
   │                                   ▼                        │
-  │  ① cortex-cli sign-proof ┌─────────────────┐              │
-  │  ──────────────────────► │   cortex-cli    │              │
-  │                          │                 │              │
-  │  ④ cortex-cli run        │  sign-proof     │              │
-  │  ──────────────────────► │  run → exec()   │              │
-  └──────────────────────────┴────────┬────────┘──────────────┘
+  │  ① cortex-cli daemon login ┌────────────────────┐         │
+  │  ──────────────────────────►   cortex-daemon    │         │
+  │                            │  · holds project   │         │
+  │  ④ cortex-cli run ─socket─►│    tokens          │         │
+  │                            │  · attests binary  │         │
+  │                            │  · spawns child    │         │
+  └────────────────────────────┴───────┬────────────┘─────────┘
                                       │
                                  exec() with env vars injected
                                       │
@@ -44,9 +45,18 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 
 **Flow:**
 1. **Admin** pre-loads project secrets into `cortex-server` via the admin API
-2. **Agent** calls `cortex-cli sign-proof` to produce an Ed25519 `auth_proof` proving its identity, signed locally with `~/.cortex/agent-<id>.key`
-3. **Agent** posts `auth_proof` to `/agent/discover` → receives a `project_token`
-4. **Agent** calls `cortex-cli run --project <name> --token <project_token>` which fetches secrets from the server and `exec()`s the target process with them injected as environment variables
+2. **Operator** runs `cortex-cli daemon login` once on each agent host (OAuth 2.0
+   device-grant) and starts `cortex-daemon`. The daemon keeps the agent's Ed25519
+   private key in mlock'd memory and registers an ephemeral attestation public
+   key at `/daemon/attest` (binary SHA-256 must be on the allowlist).
+3. **Daemon** signs `/agent/discover` with the agent's Ed25519 key on demand;
+   the first request for a new `(agent_id, project)` pair waits in `pending_grants`
+   until an admin approves it on the dashboard, after which auto-approval runs
+   for 30 days as long as the requested env-key set is a subset.
+4. **Agent** calls `cortex-cli run --project <name> --url <server> -- <cmd>`,
+   which sends one line of JSON to `~/.cortex/agent.sock`. The daemon fetches
+   secrets, spawns the child with them injected, and returns the exit code —
+   neither the project token nor the secret values traverse the socket.
 
 ## Agent Key Management Principles
 
@@ -54,7 +64,12 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 - **No human intervention per task** — agents autonomously obtain and inject secrets across any number of projects and tasks without requiring manual input for each run (except first-time project secrets access approval)
 - **Fully autonomous secret injection** — unattended agent pipelines retrieve all required credentials on demand at runtime; no operator in the loop
 - **Secrets never written to disk** — API keys, database credentials, tokens, and passwords exist only in process memory as environment variables; nothing is persisted to files
-- **Daemon mode for AI-on-the-same-UID isolation** — `cortex-daemon` (#16) holds the agent's Ed25519 private key in its own process and exposes a Unix socket (`~/.cortex/agent.sock`) where peers can request `run`/`inject_template` operations but cannot extract raw secret material
+- **Daemon mode is the only path** — `cortex-cli run` no longer accepts
+  `--token`/`--agent-id`/`--priv-key-file`. `cortex-daemon` (#16) holds the
+  agent's Ed25519 private key + project tokens in mlock'd memory, exposes
+  `~/.cortex/agent.sock` (mode 0600, SO_PEERCRED-gated), and proves its
+  identity to the server with an ephemeral Ed25519 attestation key (#17).
+  Peers can request `run` operations but cannot extract raw secret material.
 
 ## Installation
 
@@ -134,16 +149,21 @@ curl -X POST http://localhost:3000/admin/secrets \
 # Discover project secrets (authenticate with agent_id + Ed25519 signature).
 # `cortex-cli sign-proof` reads ~/.cortex/agent-<id>.key created by
 # `cortex-cli gen-key` and prints {"ts","nonce","auth_proof"}.
-PROOF=$(cortex-cli sign-proof --agent-id my-agent \
-  --priv-key-file ~/.cortex/agent-my-agent.key)
-curl -X POST http://localhost:3000/agent/discover \
-  -H "Content-Type: application/json" \
-  -d "{\"agent_id\":\"my-agent\",$(echo $PROOF | tr -d '{}'),\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
-# Save the returned project_token!
+# One-time on the agent host: register the daemon via OAuth 2.0 device-grant.
+cortex-cli daemon login --url http://localhost:3000
+# Visit the printed dashboard URL and approve the user_code.
 
-# Launch your app with secrets injected
+# Start the daemon. It generates an ephemeral attestation key, registers
+# its binary SHA-256 with /daemon/attest, and listens on
+# ~/.cortex/agent.sock with SO_PEERCRED + PR_SET_DUMPABLE + mlockall.
+cortex-daemon &
+
+# Launch your app — no token, no agent_id, no priv-key-file. The daemon
+# discovers, rotates, and injects everything transparently. The first
+# discover for a new (agent_id, project) pair is gated by an admin
+# approval flow (see "Pending Grants" in docs/USAGE.md).
 cortex-cli run \
-  --project my-app --token <project_token> --url http://localhost:3000 \
+  --project my-app --url http://localhost:3000 \
   -- python3 main.py
 ```
 

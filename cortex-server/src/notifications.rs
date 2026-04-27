@@ -35,6 +35,15 @@ pub enum NotificationEvent {
     /// The server booted via Shamir m-of-n recovery instead of the normal
     /// password unseal flow — operators should know the moment this happens.
     RecoveryBoot { hostname: Option<String> },
+    /// First-access discover from an `(agent_id, project_name)` pair. The
+    /// dashboard must approve before the agent can mint a project token.
+    PendingGrant {
+        grant_id: String,
+        agent_id: String,
+        project_name: String,
+        requested_keys: Vec<String>,
+        source_ip: Option<String>,
+    },
 }
 
 impl NotificationEvent {
@@ -42,6 +51,7 @@ impl NotificationEvent {
         match self {
             NotificationEvent::HoneyTokenAccess { .. } => "🚨 CortexAuth honey-token alarm",
             NotificationEvent::RecoveryBoot { .. } => "⚠️ CortexAuth booted in recovery mode",
+            NotificationEvent::PendingGrant { .. } => "🔔 CortexAuth pending agent approval",
         }
     }
 
@@ -61,6 +71,21 @@ impl NotificationEvent {
                  UNSEALED on {}. Verify the operators who provided shares match the \
                  expected recovery quorum.",
                 hostname.as_deref().unwrap_or("(unknown host)"),
+            ),
+            NotificationEvent::PendingGrant {
+                grant_id,
+                agent_id,
+                project_name,
+                requested_keys,
+                source_ip,
+            } => format!(
+                "Agent `{}` is requesting first-time access to project `{}` \
+                 (keys: {:?}). Source IP: {}. Approve at /admin/pending-grants/{}.",
+                agent_id,
+                project_name,
+                requested_keys,
+                source_ip.as_deref().unwrap_or("unknown"),
+                grant_id,
             ),
         }
     }

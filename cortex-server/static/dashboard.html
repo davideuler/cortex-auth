@@ -287,6 +287,12 @@ section.active { display: block; }
       <div class="nav-item" data-section="devices" onclick="App.nav('devices')">
         <span class="nav-icon">💻</span> Devices
       </div>
+      <div class="nav-item" data-section="grants" onclick="App.nav('grants')">
+        <span class="nav-icon">🔔</span> Pending Grants
+      </div>
+      <div class="nav-item" data-section="daemons" onclick="App.nav('daemons')">
+        <span class="nav-icon">🛡️</span> Daemon Allowlist
+      </div>
       <div class="nav-section">Operations</div>
       <div class="nav-item" data-section="rotate" onclick="App.nav('rotate')">
         <span class="nav-icon">🔄</span> Key Rotation
@@ -405,6 +411,45 @@ section.active { display: block; }
             </div>
           </div>
           <div class="table-wrap" id="devices-table"></div>
+        </div>
+      </section>
+
+      <!-- Pending Grants (UNCERTAINTIES #16 — first-access approval) -->
+      <section id="sec-grants">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Pending agent grants</span></div>
+          <div class="card-body" style="padding-bottom:0">
+            <p style="font-size:13px;color:var(--text-light);margin-bottom:8px">
+              The first time an agent calls <code>/agent/discover</code> for a new project, the request is held here
+              until you approve the requested key set. After approval the same <code>(agent, project, scope)</code>
+              auto-passes for 30 days; a scope expansion re-triggers approval.
+            </p>
+          </div>
+          <div class="table-wrap" id="grants-table"></div>
+        </div>
+      </section>
+
+      <!-- Daemon Allowlist (UNCERTAINTIES #17 — daemon attestation) -->
+      <section id="sec-daemons">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Allowed daemon binaries</span></div>
+          <div class="card-body" style="padding-bottom:0">
+            <p style="font-size:13px;color:var(--text-light);margin-bottom:8px">
+              SHA-256 hex of <code>cortex-daemon</code> binaries permitted to register an attestation session.
+              An empty list disables enforcement (warning-only). Compute on Linux with
+              <code>sha256sum $(which cortex-daemon)</code>.
+            </p>
+            <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+              <div style="flex:2;min-width:240px"><label>binary_sha256 (64 hex chars)</label><input id="dv-sha" type="text" placeholder="e.g. 9f1c…"></div>
+              <div style="flex:1;min-width:120px"><label>version</label><input id="dv-ver" type="text" placeholder="0.1.0"></div>
+              <button class="btn btn-primary" onclick="Daemons.add()">Add</button>
+            </div>
+          </div>
+          <div class="table-wrap" id="daemons-allowlist-table"></div>
+        </div>
+        <div class="card" style="margin-top:16px">
+          <div class="card-header"><span class="card-title">Active daemon sessions</span></div>
+          <div class="table-wrap" id="daemon-sessions-table"></div>
         </div>
       </section>
 
@@ -552,7 +597,7 @@ const App = {
     document.getElementById('setup-token').value = '';
   },
   nav(sec) {
-    const titles   = { secrets:'Secrets', agents:'Agents', policies:'Policies', namespaces:'Namespaces', projects:'Projects', audit:'Audit Logs', rotate:'Key Rotation', notifications:'Notifications', devices:'Devices', shamir:'Shamir Recovery' };
+    const titles   = { secrets:'Secrets', agents:'Agents', policies:'Policies', namespaces:'Namespaces', projects:'Projects', audit:'Audit Logs', rotate:'Key Rotation', notifications:'Notifications', devices:'Devices', grants:'Pending Grants', daemons:'Daemon Allowlist', shamir:'Shamir Recovery' };
     const actions  = {
       secrets:    `<button class="btn btn-primary" onclick="Secrets.openCreate()">+ Add Secret</button><button class="btn btn-secondary" onclick="Secrets.load()">↻</button>`,
       agents:     `<button class="btn btn-primary" onclick="Agents.openCreate()">+ Register Agent</button><button class="btn btn-secondary" onclick="Agents.load()">↻</button>`,
@@ -562,10 +607,12 @@ const App = {
       audit:      `<button class="btn btn-secondary" onclick="Audit.load()">↻ Refresh</button>`,
       notifications: `<button class="btn btn-primary" onclick="Notifications.openCreate()">+ New Channel</button><button class="btn btn-secondary" onclick="Notifications.load()">↻</button>`,
       devices:    `<button class="btn btn-secondary" onclick="Devices.load()">↻ Refresh</button>`,
+      grants:     `<button class="btn btn-secondary" onclick="Grants.load()">↻ Refresh</button>`,
+      daemons:    `<button class="btn btn-secondary" onclick="Daemons.load()">↻ Refresh</button>`,
       rotate:     '',
       shamir:     '',
     };
-    const loaders  = { secrets: Secrets.load, agents: Agents.load, policies: Policies.load, namespaces: Namespaces.load, projects: Projects.load, audit: Audit.load, notifications: Notifications.load, devices: Devices.load };
+    const loaders  = { secrets: Secrets.load, agents: Agents.load, policies: Policies.load, namespaces: Namespaces.load, projects: Projects.load, audit: Audit.load, notifications: Notifications.load, devices: Devices.load, grants: Grants.load, daemons: Daemons.load };
     document.querySelectorAll('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.section === sec));
     document.getElementById('page-title').textContent = titles[sec] || sec;
     document.getElementById('topbar-actions').innerHTML = actions[sec] || '';
@@ -1123,6 +1170,138 @@ const Devices = {
   async del(agent_id) {
     if (!confirm(`Revoke device session for ${agent_id}?`)) return;
     try { await API.del(`/admin/devices/${encodeURIComponent(agent_id)}`); toast('Revoked', 'success'); Devices.load(); }
+    catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+};
+
+// ── Pending Grants (UNCERTAINTIES #16) ─────────────────────────────────────
+const Grants = {
+  async load() {
+    const el = document.getElementById('grants-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/pending-grants');
+      if (!rows.length) {
+        el.innerHTML = emptyHTML('🔔', 'No pending grants', 'Discover requests from new agents land here for review.');
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>status</th><th>agent_id</th><th>project</th><th>requested keys</th><th>requested at</th><th>auto-approval until</th><th>Actions</th></tr></thead>
+        <tbody>${rows.map(g => `<tr>
+          <td><span class="badge ${g.status==='approved'?'badge-green':g.status==='pending'?'badge-orange':g.status==='denied'?'badge-gray':'badge-gray'}">${esc(g.status)}</span></td>
+          <td>${esc(g.agent_id)}</td>
+          <td>${esc(g.project_name)} <span class="badge badge-gray">${esc(g.namespace)}</span></td>
+          <td><code style="font-size:11px">${esc((g.requested_keys||[]).join(', '))}</code></td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(g.requested_at)}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(g.auto_approval_until)}</td>
+          <td style="white-space:nowrap">
+            ${g.status==='pending' ? `
+              <button class="btn btn-primary btn-sm" onclick='Grants.approve(${JSON.stringify(g.id)},${JSON.stringify(g.requested_keys||[])})'>✓ Approve</button>
+              <button class="btn btn-danger btn-sm"  onclick='Grants.deny(${JSON.stringify(g.id)})'>✗ Deny</button>
+            ` : `
+              <button class="btn btn-secondary btn-sm" onclick='Grants.del(${JSON.stringify(g.id)})'>🗑 Remove</button>
+            `}
+          </td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+      toast('Failed: ' + e.message, 'error');
+    }
+  },
+  async approve(id, requestedKeys) {
+    const picked = prompt(
+      'Approved keys (comma-separated, blank = all). Requested:\n' + requestedKeys.join(', '),
+      requestedKeys.join(', ')
+    );
+    if (picked === null) return;
+    const list = picked.trim() ? picked.split(',').map(s => s.trim()).filter(Boolean) : null;
+    try {
+      await API.post(`/admin/pending-grants/${encodeURIComponent(id)}/approve`,
+        list ? { approved_keys: list } : {});
+      toast('Approved', 'success'); Grants.load();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+  async deny(id) {
+    if (!confirm('Deny this grant? The agent will be blocked from this project until you delete the row.')) return;
+    try { await API.post(`/admin/pending-grants/${encodeURIComponent(id)}/deny`, {}); toast('Denied', 'success'); Grants.load(); }
+    catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+  async del(id) {
+    if (!confirm('Delete this grant row?')) return;
+    try { await API.del(`/admin/pending-grants/${encodeURIComponent(id)}`); toast('Deleted', 'success'); Grants.load(); }
+    catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+};
+
+// ── Daemon Allowlist + sessions (UNCERTAINTIES #17) ────────────────────────
+const Daemons = {
+  async load() {
+    Daemons.loadAllowlist();
+    Daemons.loadSessions();
+  },
+  async loadAllowlist() {
+    const el = document.getElementById('daemons-allowlist-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/allowed-daemon-versions');
+      if (!rows.length) {
+        el.innerHTML = emptyHTML('🛡️', 'No binaries allowlisted', 'Add at least one SHA-256 to enforce attestation.');
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>SHA-256</th><th>version</th><th>description</th><th>enabled</th><th>added</th><th></th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td><code style="font-size:11px">${esc(r.binary_sha256)}</code></td>
+          <td>${esc(r.version||'—')}</td>
+          <td style="color:var(--text-light)">${esc(r.description||'—')}</td>
+          <td>${r.enabled ? '<span class="badge badge-green">on</span>' : '<span class="badge badge-gray">off</span>'}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(r.created_at)}</td>
+          <td><button class="btn btn-danger btn-sm" onclick='Daemons.del(${JSON.stringify(r.binary_sha256)})'>🗑</button></td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+    }
+  },
+  async loadSessions() {
+    const el = document.getElementById('daemon-sessions-table');
+    el.innerHTML = loadHTML();
+    try {
+      const rows = await API.get('/admin/daemon-sessions');
+      if (!rows.length) {
+        el.innerHTML = emptyHTML('🛡️', 'No active daemon sessions', '<code>cortex-daemon</code> registers a session at startup.');
+        return;
+      }
+      el.innerHTML = `<table>
+        <thead><tr><th>agent_id</th><th>session_id</th><th>binary_sha256</th><th>version</th><th>pid/uid</th><th>host</th><th>created</th><th>expires</th></tr></thead>
+        <tbody>${rows.map(d => `<tr>
+          <td>${esc(d.agent_id)}</td>
+          <td><code style="font-size:11px">${esc(d.session_id.slice(0,8))}…</code></td>
+          <td><code style="font-size:11px">${esc((d.binary_sha256||'').slice(0,16))}…</code></td>
+          <td>${esc(d.daemon_version||'—')}</td>
+          <td style="color:var(--text-light);font-size:12px">${d.daemon_pid||'—'}/${d.daemon_uid||'—'}</td>
+          <td style="color:var(--text-light)">${esc(d.hostname||'—')}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(d.created_at)}</td>
+          <td style="color:var(--text-light);font-size:12px">${fmtDate(d.expires_at)}</td>
+        </tr>`).join('')}</tbody></table>`;
+    } catch(e) {
+      el.innerHTML = `<div class="loading" style="color:var(--danger)">${esc(e.message)}</div>`;
+    }
+  },
+  async add() {
+    const sha = document.getElementById('dv-sha').value.trim().toLowerCase();
+    const ver = document.getElementById('dv-ver').value.trim();
+    if (!/^[a-f0-9]{64}$/.test(sha)) { toast('SHA-256 must be 64 hex chars', 'error'); return; }
+    try {
+      await API.post('/admin/allowed-daemon-versions', { binary_sha256: sha, version: ver || null });
+      toast('Added', 'success');
+      document.getElementById('dv-sha').value = '';
+      document.getElementById('dv-ver').value = '';
+      Daemons.loadAllowlist();
+    } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+  async del(sha) {
+    if (!confirm(`Remove ${sha.slice(0,16)}…?`)) return;
+    try { await API.del(`/admin/allowed-daemon-versions/${encodeURIComponent(sha)}`); toast('Removed', 'success'); Daemons.loadAllowlist(); }
     catch(e) { toast('Error: ' + e.message, 'error'); }
   },
 };

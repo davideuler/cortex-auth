@@ -44,9 +44,10 @@
 
 **执行流程：**
 1. **管理员** 通过 admin API 将项目密钥预存至 `cortex-server`
-2. **Agent** 调用 `cortex-cli sign-proof` 用本地 Ed25519 私钥签名 `auth_proof` 以证明身份
+2. **Operator** 在每台 agent 主机上一次性运行 `cortex-cli daemon login`（OAuth 2.0 device-grant）并启动 `cortex-daemon`。daemon 在 mlock 内存中保存 agent 的 Ed25519 私钥，并向 `/daemon/attest` 注册一次性 attestation 公钥（二进制 SHA-256 必须在白名单里）。
+2.5. **Daemon** 内部按需用 agent Ed25519 私钥签名调用 `/agent/discover`；同一 `(agent_id, project)` 首次访问会落入 `pending_grants`，待管理员在 dashboard 审批后，30 天内自动放行（仅当请求的 env-key 集合是已审批集合的子集）。
 3. **Agent** 将 `auth_proof` POST 到 `/agent/discover` → 获取 `project_token`
-4. **Agent** 调用 `cortex-cli run --project <name> --token <project_token>`，从服务器拉取密钥并通过 `exec()` 将其注入为环境变量后启动目标进程
+4. **Agent** 调用 `cortex-cli run --project <name> --url <server> -- <cmd>`，命令通过 `~/.cortex/agent.sock` 向 daemon 发送一行 JSON。daemon 拉取密钥并将其作为环境变量注入子进程；project_token 与密钥值都不会经过 socket 返回 CLI。
 
 ## Agent 密钥管理原则
 
@@ -130,19 +131,20 @@ curl -X POST http://localhost:3000/admin/secrets \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-your-key"}'
 
-# 发现项目密钥（使用 agent_id + Ed25519 签名进行认证）
-# `cortex-cli sign-proof` 读取 `cortex-cli gen-key` 生成的私钥
-# (~/.cortex/agent-<id>.key)，输出 {"ts","nonce","auth_proof"} JSON。
-PROOF=$(cortex-cli sign-proof --agent-id my-agent \
-  --priv-key-file ~/.cortex/agent-my-agent.key)
-curl -X POST http://localhost:3000/agent/discover \
-  -H "Content-Type: application/json" \
-  -d "{\"agent_id\":\"my-agent\",$(echo $PROOF | tr -d '{}'),\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
-# 保存返回的 project_token！
+# 在 agent 主机上一次性注册 daemon（OAuth 2.0 device-grant）
+cortex-cli daemon login --url http://localhost:3000
+# 访问打印出的 dashboard URL，输入 user_code 完成审批
 
-# 注入密钥并启动应用
+# 启动 daemon。它会生成一次性 attestation 密钥、向 /daemon/attest 注册
+# 自身二进制 SHA-256，并在 ~/.cortex/agent.sock 上监听（SO_PEERCRED 校验
+# 调用方 UID，PR_SET_DUMPABLE=0 + mlockall 阻止 ptrace 与换页）。
+cortex-daemon &
+
+# 启动应用 — 不再传 --token / --agent-id / --priv-key-file。
+# daemon 自动处理 discover、token 轮转、密钥注入。
+# 同一 (agent_id, project_name) 第一次访问需管理员在 dashboard 审批。
 cortex-cli run \
-  --project my-app --token <project_token> --url http://localhost:3000 \
+  --project my-app --url http://localhost:3000 \
   -- python3 main.py
 ```
 

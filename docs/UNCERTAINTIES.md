@@ -247,7 +247,8 @@ See `cortex-server/src/shamir.rs` and `cortex-server/src/kek.rs::unseal_via_reco
 
 ## 16. cortex-cli Daemon + Device Authorization (April 2026)
 
-**Resolved (basic)**. Server-side endpoints + scaffolding daemon + dashboard UI:
+**Resolved (full)**. The daemon now holds project tokens transparently;
+`cortex-cli run` no longer accepts `--token`/`--agent-id`/`--priv-key-file`.
 
 Server endpoints (in `cortex-server/src/api/agent.rs` + `admin.rs`):
 - `POST /device/authorize`            — issues `device_code` + `user_code` (10 min TTL).
@@ -264,11 +265,25 @@ client flow, persisting the access token at `~/.cortex/daemon-session.json` (mod
 `cortex-daemon` (separate binary in the cortex-cli crate) listens on
 `~/.cortex/agent.sock` (mode 0600) with a single-line JSON protocol:
 
-- `{"cmd":"status"}` → returns the cached daemon-session JSON.
-- `{"cmd":"run","program":..,"args":..,"project":..,"token":..,"url":..}` → fetches
-  secrets, spawns the program with the env vars injected, returns
-  `{"ok":true,"exit_code":N}` after the child exits. The raw secret values never travel
-  back over the socket.
+- `{"cmd":"status"}` → returns the cached daemon-session JSON + the live attestation session_id.
+- `{"cmd":"run","program":..,"args":..,"project":..,"url":..}` → daemon **discovers
+  the project token internally** (auto-rotating on expiry), fetches secrets, spawns
+  the program with the env vars injected, returns `{"ok":true,"exit_code":N}` after
+  the child exits. The raw secret values never travel back over the socket and the
+  CLI never sees a project token. Pending admin approval is propagated as
+  `{"ok":false,"error_code":"pending_approval","grant_id":..,"requested_keys":[..]}`.
+
+**First-access approval (`pending_grants`)**: `/agent/discover` no longer
+auto-issues tokens for unfamiliar `(agent_id, project_name)` pairs. The first
+discover creates a row in `pending_grants` (status=`pending`) and notifies the
+configured channels. After the admin approves via `POST /admin/pending-grants/:id/approve`,
+subsequent discovers within a 30-day window auto-pass as long as the requested
+scope is a subset of the approved keys; broader scopes re-trigger approval.
+
+**Daemon hardening implemented**:
+- `prctl(PR_SET_DUMPABLE, 0)` + `mlockall(MCL_CURRENT|MCL_FUTURE)` at process start.
+- Per-connection SO_PEERCRED check rejects callers whose UID does not match the daemon's.
+- Project token cache persisted at `~/.cortex/daemon-projects.json` (mode 0600).
 
 **Still open**:
 - SSO integration at `/auth/oidc/*` — today device approval is admin-token-gated, not
@@ -276,30 +291,50 @@ client flow, persisting the access token at `~/.cortex/daemon-session.json` (mod
 - Frequency limits (1 authorize/min/IP, 5 devices/user/day) — rate limiting is generally
   absent; tracked under NEXT_STEPS #3.
 - `inject_template` and `ssh_proxy` socket commands.
-- Daemon attestation (#17 below).
-- OS-level hardening: `prctl(PR_SET_DUMPABLE, 0)`, `mlockall`, sysctl
-  `kernel.yama.ptrace_scope=2`, `MemoryDenyWriteExecute=yes`, `PT_DENY_ATTACH` on macOS.
+- systemd unit hardening (`MemoryDenyWriteExecute=yes`, `NoNewPrivileges=yes`,
+  `ProtectKernelTunables=yes`) and `PT_DENY_ATTACH` on macOS — recipe is in `docs/USAGE.md`.
 
 ---
 
-## 17. Daemon Attestation Header (deferred)
+## 17. Daemon Attestation Header (April 2026)
 
-**Design intent (UPDATED_DESIGN.md §"daemon attestation header")**: After the daemon
-logs in, it generates a per-process `attestation_priv` (Ed25519, never written to disk)
-and registers `attestation_pub` with the server via `POST /daemon/attest`. Every
-sensitive request afterwards must carry an `X-Daemon-Attestation` header signed by
-`attestation_priv` covering `(session_id, ts, jti, method, path, body_sha256,
-auth_token_id)`. The server checks the binary SHA-256 against an allowed-daemon-versions
-whitelist on attestation, and only sessions backed by approved binaries can read secrets.
+**Resolved**. Implemented end-to-end via the new `/daemon/attest` endpoint and
+the `X-Daemon-Attestation` request header.
 
-**Status**: NOT IMPLEMENTED. Depends on #16 (the daemon must exist first). Needs:
-- New `daemon_sessions` table.
-- New `allowed_daemon_versions` table populated from a project-signed release manifest.
-- Per-request attestation verification middleware.
-- Replay protection (5-minute jti cache).
-- OS-level hardening guidance: `prctl(PR_SET_DUMPABLE, 0)`, `mlockall`, sysctl
-  `kernel.yama.ptrace_scope=2`, systemd unit `MemoryDenyWriteExecute=yes`,
-  `PT_DENY_ATTACH` on macOS.
+**Schema** (migration `010_pending_grants_and_daemon_attestation.sql`):
+- `daemon_sessions(session_id, agent_id, attestation_pub, binary_sha256,
+  daemon_version, daemon_pid, daemon_uid, hostname, created_at, expires_at,
+  revoked_at)` — 24-hour TTL per session.
+- `allowed_daemon_versions(binary_sha256, version, description, enabled, created_at)`
+  — operator-curated allowlist; an empty table means "not enforced", so existing
+  deployments do not break on upgrade.
+- `daemon_attest_seen_jti(jti, seen_at)` — 5-minute replay-protection cache.
+
+**Daemon side** (`cortex-cli/src/daemon.rs`):
+1. At startup the daemon hardens the process (`PR_SET_DUMPABLE=0`, `mlockall`),
+   loads its access_token, decodes the `sub` claim to learn `agent_id`, and
+   loads the agent Ed25519 private key from `~/.cortex/agent-<id>.key`.
+2. It computes its own binary SHA-256 from `/proc/self/exe`.
+3. It generates an ephemeral Ed25519 attestation keypair — **the private half
+   never touches disk**.
+4. It posts `{attestation_pub, binary_sha256, daemon_version, daemon_pid,
+   daemon_uid, hostname}` to `/daemon/attest` and receives a `session_id`.
+5. Every sensitive HTTP request afterwards carries
+   `X-Daemon-Attestation: <session_id>.<ts>.<jti>.<body_sha256>.<sig_b64>`,
+   where `sig` is Ed25519 over `"<ts>|<jti>|<METHOD>|<path>|<body_sha256>"`.
+
+**Server side** (`cortex-server/src/api/daemon.rs`):
+- `verify_attestation_header(state, headers, method, path, body)` validates the
+  ts window (±5 min), recomputes `body_sha256`, looks up the session, checks
+  `revoked_at` + `expires_at`, verifies the signature with the registered
+  `attestation_pub`, and rejects replays via `INSERT OR IGNORE` against
+  `daemon_attest_seen_jti`. Best-effort cleanup deletes jtis older than 10 min.
+- Allowlist enforcement: when `allowed_daemon_versions` is non-empty, an
+  attest call with a SHA-256 not in the allowlist or with `enabled=0`
+  returns 403 with `error_code: binary_not_allowed` / `binary_disabled`.
+
+**Dashboard**: a "Daemon Allowlist" page lists active sessions and lets
+operators add or remove approved binary hashes (admin-token gated).
 
 ---
 
