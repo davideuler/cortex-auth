@@ -2,16 +2,14 @@
 
 ## Quick Start
 
-### 1. Generate Required Keys
+### 1. Generate the Admin Token
 
 ```bash
-# Generate a 32-byte encryption key (hex)
-openssl rand -hex 32
-# Example output: a3f1c2d4e5b6a7f8...
-
-# Generate an admin token
 openssl rand -hex 16
 ```
+
+The encryption key (KEK) is **not** an environment variable any more — it is derived
+from a passphrase you type at server startup.
 
 ### 2. Configure Environment
 
@@ -19,7 +17,6 @@ Create a `.env` file (never commit this):
 
 ```env
 DATABASE_URL=sqlite://cortex-auth.db
-ENCRYPTION_KEY=<64-hex-chars-from-step-1>
 ADMIN_TOKEN=<your-admin-token>
 PORT=3000
 ```
@@ -30,9 +27,15 @@ PORT=3000
 # Build
 cargo build --release
 
-# Run (reads .env automatically via dotenvy)
+# Run (reads .env automatically via dotenvy). The server boots SEALED and
+# prompts for the KEK operator password on stdin; once verified against the
+# on-disk sentinel it transitions to UNSEALED and binds :3000.
 ./target/release/cortex-server
+# [cortex-server SEALED] Enter KEK operator password: ********
 ```
+
+For headless / supervised deployments, supply the password through `CORTEX_KEK_PASSWORD`
+instead of stdin (e.g. read it from a secrets manager into the unit's environment).
 
 ---
 
@@ -284,16 +287,16 @@ The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its environme
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ENCRYPTION_KEY` | Yes | 64 hex chars (32 bytes) for AES-256-GCM |
+| `CORTEX_KEK_PASSWORD` | No (interactive) | KEK operator password. If unset, the server prompts on stdin. |
 | `ADMIN_TOKEN` | Yes | Static token for admin API access |
 | `DATABASE_URL` | No | SQLite path (default: `sqlite://cortex-auth.db`) |
 | `PORT` | No | HTTP listen port (default: 3000) |
 
 ### Security Checklist
 
-- [ ] Rotate `ENCRYPTION_KEY` periodically (requires re-encrypting all secrets)
+- [ ] Rotate the KEK periodically via `POST /admin/rotate-key` and restart with the new password
 - [ ] Use a strong random `ADMIN_TOKEN` (at least 32 bytes)
 - [ ] Run behind a reverse proxy with TLS (nginx, caddy)
 - [ ] Restrict network access to the admin port
 - [ ] Back up the SQLite database regularly
-- [ ] Store `ENCRYPTION_KEY` and `ADMIN_TOKEN` in a secrets manager (not in .env files on disk)
+- [ ] Pull `CORTEX_KEK_PASSWORD` and `ADMIN_TOKEN` from a secrets manager (not from `.env` on disk)

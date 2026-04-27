@@ -6,6 +6,8 @@ pub struct Secret {
     pub key_path: String,
     pub secret_type: String,
     pub encrypted_value: String,
+    pub wrapped_dek: Option<String>,
+    pub kek_version: i64,
     pub description: Option<String>,
     pub namespace: String,
     pub created_at: String,

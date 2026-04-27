@@ -10,12 +10,12 @@ use uuid::Uuid;
 
 use crate::{
     audit,
-    config::parse_hex_key,
     crypto,
     error::AppError,
     models::{
         agent::{AgentListItem, CreateAgentRequest},
         audit_log::AuditLog,
+        namespace::{CreateNamespaceRequest, Namespace},
         policy::{CreatePolicyRequest, PolicyDetail},
         project::ProjectListItem,
         secret::{CreateSecretRequest, SecretDetail, SecretListItem, UpdateSecretRequest},
@@ -36,6 +36,8 @@ pub fn router() -> Router<AppState> {
         .route("/policies/:id", delete(delete_policy))
         .route("/projects", get(list_projects))
         .route("/projects/:project_name/revoke", post(revoke_project_token))
+        .route("/namespaces", get(list_namespaces).post(create_namespace))
+        .route("/namespaces/:name", delete(delete_namespace))
         .route("/audit-logs", get(list_audit_logs))
         .route("/rotate-key", post(rotate_key))
 }
@@ -52,9 +54,17 @@ fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError
 }
 
 const SECRET_SELECT: &str =
-    "SELECT id, key_path, secret_type, encrypted_value, description, namespace, created_at, updated_at FROM secrets";
+    "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, created_at, updated_at FROM secrets";
 const AGENT_SELECT: &str =
-    "SELECT id, agent_id, jwt_secret_encrypted, description, namespace, created_at FROM agents";
+    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
+
+async fn ensure_namespace_exists(state: &AppState, name: &str) -> Result<(), AppError> {
+    sqlx::query("INSERT OR IGNORE INTO namespaces (name) VALUES (?)")
+        .bind(name)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
+}
 
 async fn list_secrets(
     headers: HeaderMap,
@@ -98,17 +108,19 @@ async fn create_secret(
     }
 
     let namespace = req.namespace.unwrap_or_else(|| "default".to_string());
+    ensure_namespace_exists(&state, &namespace).await?;
+
     let id = Uuid::new_v4().to_string();
-    let encrypted = crypto::encrypt(&req.value, &state.config.encryption_key)
-        .map_err(AppError::Internal)?;
+    let envelope = crypto::seal_envelope(&req.value, &state.kek).map_err(AppError::Internal)?;
 
     sqlx::query(
-        "INSERT INTO secrets (id, key_path, secret_type, encrypted_value, description, namespace) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO secrets (id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&id)
     .bind(&req.key_path)
     .bind(&req.secret_type)
-    .bind(&encrypted)
+    .bind(&envelope.body_ciphertext)
+    .bind(&envelope.wrapped_dek)
     .bind(&req.description)
     .bind(&namespace)
     .execute(&state.pool)
@@ -155,7 +167,11 @@ async fn get_secret(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Secret '{}' not found", id)))?;
 
-    let value = crypto::decrypt(&secret.encrypted_value, &state.config.encryption_key)
+    let wrapped = secret
+        .wrapped_dek
+        .as_deref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Secret missing wrapped_dek")))?;
+    let value = crypto::open_envelope(&secret.encrypted_value, wrapped, &state.kek)
         .map_err(AppError::Internal)?;
 
     Ok(Json(SecretDetail {
@@ -186,18 +202,26 @@ async fn update_secret(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Secret '{}' not found", id)))?;
 
-    let new_encrypted = if let Some(new_value) = &req.value {
-        crypto::encrypt(new_value, &state.config.encryption_key).map_err(AppError::Internal)?
+    let (new_body, new_wrapped) = if let Some(new_value) = &req.value {
+        let env = crypto::seal_envelope(new_value, &state.kek).map_err(AppError::Internal)?;
+        (env.body_ciphertext, env.wrapped_dek)
     } else {
-        existing.encrypted_value.clone()
+        (
+            existing.encrypted_value.clone(),
+            existing
+                .wrapped_dek
+                .clone()
+                .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Existing secret missing wrapped_dek")))?,
+        )
     };
 
     let new_description = req.description.or(existing.description);
 
     sqlx::query(
-        "UPDATE secrets SET encrypted_value = ?, description = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE secrets SET encrypted_value = ?, wrapped_dek = ?, description = ?, updated_at = datetime('now') WHERE id = ?",
     )
-    .bind(&new_encrypted)
+    .bind(&new_body)
+    .bind(&new_wrapped)
     .bind(&new_description)
     .bind(&id)
     .execute(&state.pool)
@@ -283,16 +307,19 @@ async fn create_agent(
     check_admin_token(&headers, &state.config.admin_token)?;
 
     let namespace = req.namespace.unwrap_or_else(|| "default".to_string());
+    ensure_namespace_exists(&state, &namespace).await?;
+
     let id = Uuid::new_v4().to_string();
-    let encrypted_secret = crypto::encrypt(&req.jwt_secret, &state.config.encryption_key)
-        .map_err(AppError::Internal)?;
+    let envelope =
+        crypto::seal_envelope(&req.jwt_secret, &state.kek).map_err(AppError::Internal)?;
 
     sqlx::query(
-        "INSERT INTO agents (id, agent_id, jwt_secret_encrypted, description, namespace) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO agents (id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace) VALUES (?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&id)
     .bind(&req.agent_id)
-    .bind(&encrypted_secret)
+    .bind(&envelope.body_ciphertext)
+    .bind(&envelope.wrapped_dek)
     .bind(&req.description)
     .bind(&namespace)
     .execute(&state.pool)
@@ -470,7 +497,6 @@ async fn revoke_project_token(
     .await?;
 
     if result.rows_affected() == 0 {
-        // Distinguish "not found" from "already revoked".
         let exists: Option<(String,)> =
             sqlx::query_as("SELECT project_name FROM projects WHERE project_name = ?")
                 .bind(&project_name)
@@ -505,6 +531,100 @@ async fn revoke_project_token(
     })))
 }
 
+async fn list_namespaces(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Namespace>>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let rows = sqlx::query_as::<_, Namespace>(
+        "SELECT name, description, created_at FROM namespaces ORDER BY name",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(rows))
+}
+
+async fn create_namespace(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<CreateNamespaceRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("namespace name cannot be empty".into()));
+    }
+
+    sqlx::query("INSERT INTO namespaces (name, description) VALUES (?, ?)")
+        .bind(name)
+        .bind(&req.description)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("UNIQUE constraint") {
+                AppError::Conflict(format!("Namespace '{}' already exists", name))
+            } else {
+                AppError::Database(e)
+            }
+        })?;
+
+    audit::write(&state, None, None, "create_namespace", Some(name), "success").await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "name": name, "description": req.description })),
+    ))
+}
+
+async fn delete_namespace(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    if name == "default" {
+        return Err(AppError::BadRequest(
+            "Cannot delete the 'default' namespace".into(),
+        ));
+    }
+
+    // Refuse if any rows still reference the namespace; otherwise the orphaned
+    // rows would survive in a phantom namespace and confuse listing/auditing.
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM secrets WHERE namespace = ?), \
+                (SELECT COUNT(*) FROM agents WHERE namespace = ?), \
+                (SELECT COUNT(*) FROM projects WHERE namespace = ?)",
+    )
+    .bind(&name)
+    .bind(&name)
+    .bind(&name)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if counts.0 + counts.1 + counts.2 > 0 {
+        return Err(AppError::Conflict(format!(
+            "Namespace '{}' is in use (secrets={}, agents={}, projects={})",
+            name, counts.0, counts.1, counts.2
+        )));
+    }
+
+    let result = sqlx::query("DELETE FROM namespaces WHERE name = ?")
+        .bind(&name)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("Namespace '{}' not found", name)));
+    }
+
+    audit::write(&state, None, None, "delete_namespace", Some(&name), "success").await;
+    Ok(Json(json!({ "deleted": true, "name": name })))
+}
+
 async fn list_audit_logs(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -521,63 +641,102 @@ async fn list_audit_logs(
 }
 
 #[derive(Debug, Deserialize)]
-struct RotateKeyRequest {
-    new_encryption_key: String,
+struct RotateKekRequest {
+    new_kek_password: String,
 }
 
+/// Rotate the KEK by re-deriving from a new operator password and re-wrapping
+/// every per-row DEK. Body ciphertexts (encrypted with the random per-row DEK)
+/// are untouched, so this is O(rows) wraps — never an O(rows) re-encryption.
 async fn rotate_key(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(req): Json<RotateKeyRequest>,
+    Json(req): Json<RotateKekRequest>,
 ) -> Result<Json<Value>, AppError> {
     check_admin_token(&headers, &state.config.admin_token)?;
 
-    let new_key = parse_hex_key(&req.new_encryption_key)
-        .map_err(|e| AppError::BadRequest(format!("Invalid new_encryption_key: {}", e)))?;
+    let new_password = req.new_kek_password.trim();
+    if new_password.is_empty() {
+        return Err(AppError::BadRequest("new_kek_password cannot be empty".into()));
+    }
+
+    let new_salt = crypto::random_salt();
+    let new_kek =
+        crypto::derive_kek(new_password, &new_salt).map_err(AppError::Internal)?;
 
     let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(SECRET_SELECT)
         .fetch_all(&state.pool)
         .await?;
-
     let agents = sqlx::query_as::<_, crate::models::agent::Agent>(AGENT_SELECT)
         .fetch_all(&state.pool)
         .await?;
 
+    let new_kek_version: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE((SELECT kek_version FROM kek_metadata WHERE id = 1), 1) + 1",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+
     let mut tx = state.pool.begin().await?;
 
-    for secret in &secrets {
-        let plaintext = crypto::decrypt(&secret.encrypted_value, &state.config.encryption_key)
+    for s in &secrets {
+        let wrapped = s
+            .wrapped_dek
+            .as_deref()
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("secret missing wrapped_dek")))?;
+        let plaintext = crypto::open_envelope(&s.encrypted_value, wrapped, &state.kek)
             .map_err(AppError::Internal)?;
-        let re_encrypted = crypto::encrypt(&plaintext, &new_key).map_err(AppError::Internal)?;
+        let env = crypto::seal_envelope(&plaintext, &new_kek).map_err(AppError::Internal)?;
         sqlx::query(
-            "UPDATE secrets SET encrypted_value = ?, updated_at = datetime('now') WHERE id = ?",
+            "UPDATE secrets SET encrypted_value = ?, wrapped_dek = ?, kek_version = ?, updated_at = datetime('now') WHERE id = ?",
         )
-        .bind(&re_encrypted)
-        .bind(&secret.id)
+        .bind(&env.body_ciphertext)
+        .bind(&env.wrapped_dek)
+        .bind(new_kek_version)
+        .bind(&s.id)
         .execute(&mut *tx)
         .await?;
     }
 
-    for agent in &agents {
-        let plaintext =
-            crypto::decrypt(&agent.jwt_secret_encrypted, &state.config.encryption_key)
-                .map_err(AppError::Internal)?;
-        let re_encrypted = crypto::encrypt(&plaintext, &new_key).map_err(AppError::Internal)?;
-        sqlx::query("UPDATE agents SET jwt_secret_encrypted = ? WHERE id = ?")
-            .bind(&re_encrypted)
-            .bind(&agent.id)
-            .execute(&mut *tx)
-            .await?;
+    for a in &agents {
+        let wrapped = a
+            .wrapped_dek
+            .as_deref()
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
+        let plaintext = crypto::open_envelope(&a.jwt_secret_encrypted, wrapped, &state.kek)
+            .map_err(AppError::Internal)?;
+        let env = crypto::seal_envelope(&plaintext, &new_kek).map_err(AppError::Internal)?;
+        sqlx::query(
+            "UPDATE agents SET jwt_secret_encrypted = ?, wrapped_dek = ?, kek_version = ? WHERE id = ?",
+        )
+        .bind(&env.body_ciphertext)
+        .bind(&env.wrapped_dek)
+        .bind(new_kek_version)
+        .bind(&a.id)
+        .execute(&mut *tx)
+        .await?;
     }
+
+    let new_sentinel = crypto::seal_sentinel(&new_kek).map_err(AppError::Internal)?;
+    let new_salt_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &new_salt);
+    sqlx::query(
+        "UPDATE kek_metadata SET salt = ?, sentinel_ciphertext = ?, kek_version = ?, updated_at = datetime('now') WHERE id = 1",
+    )
+    .bind(&new_salt_b64)
+    .bind(&new_sentinel)
+    .bind(new_kek_version)
+    .execute(&mut *tx)
+    .await?;
 
     tx.commit().await?;
 
-    audit::write(&state, None, None, "rotate_key", None, "success").await;
+    audit::write(&state, None, None, "rotate_kek", None, "success").await;
 
     Ok(Json(json!({
         "rotated": true,
-        "secrets_updated": secrets.len(),
-        "agents_updated": agents.len(),
-        "message": "Key rotation complete. Update ENCRYPTION_KEY env var and restart server."
+        "secrets_rewrapped": secrets.len(),
+        "agents_rewrapped": agents.len(),
+        "new_kek_version": new_kek_version,
+        "message": "KEK rotated. Restart the server with the NEW operator password to reload the KEK into memory."
     })))
 }

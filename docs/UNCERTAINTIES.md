@@ -57,13 +57,11 @@ Yes, put a namespace for secret. and also a namespace for project/agent too.
 
 ## 5. Encryption Key Rotation
 
-**Issue**: If the `ENCRYPTION_KEY` changes, all stored encrypted values become unreadable. There is no key rotation mechanism.
-
-**Question**: Is key rotation required? If so, a migration utility is needed that:
-1. Decrypts all secrets with the old key
-2. Re-encrypts with the new key
-3. Updates the database atomically
-Yes
+**Resolved**. The data model is now envelope-encrypted (per-row DEKs wrapped by an in-memory KEK).
+`POST /admin/rotate-key {"new_kek_password": "..."}` re-derives the KEK from a new operator
+passphrase, re-wraps every DEK, and bumps `kek_version`. Body ciphertexts are untouched, so
+rotation is O(rows wrapped) rather than O(rows re-encrypted). The server must be restarted with
+the new passphrase afterward to pick up the new KEK in memory.
 
 ---
 
