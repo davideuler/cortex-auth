@@ -8,10 +8,13 @@ use argon2::{
     Algorithm, Argon2, Params, Version,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Plaintext stub stored alongside the KEK — decrypting it on startup proves
 /// the operator-supplied password produced the same KEK as the prior boot.
@@ -204,6 +207,32 @@ pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// Derive a secondary 32-byte key from the KEK for HMAC-chaining audit log
+/// entries. Uses HMAC-SHA256 with a fixed domain separator so the audit MAC
+/// key is reproducible from the same KEK but is not the KEK itself — leaking
+/// the audit MAC key cannot decrypt any secret.
+pub fn derive_audit_mac_key(kek: &Kek) -> [u8; 32] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(kek.as_bytes())
+        .expect("HMAC accepts any key size");
+    mac.update(b"cortex-auth/audit-mac-v1");
+    let out = mac.finalize().into_bytes();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&out);
+    key
+}
+
+/// Compute the HMAC-SHA256 MAC over `prev_hash || canonical_payload`. The
+/// audit log is a hash chain: each row's `entry_mac` covers the previous
+/// row's `entry_mac`, so any deletion or reorder breaks the chain.
+pub fn audit_chain_mac(audit_mac_key: &[u8; 32], prev_hash: &str, payload: &str) -> String {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(audit_mac_key)
+        .expect("HMAC accepts any key size");
+    mac.update(prev_hash.as_bytes());
+    mac.update(b"\n");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 #[cfg(test)]

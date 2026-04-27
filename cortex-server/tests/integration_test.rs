@@ -882,8 +882,8 @@ async fn test_discover_returns_token_expiration_metadata() {
     let body = body_json(resp.into_body()).await;
 
     assert!(body["token_expires_at"].as_str().is_some());
-    // Default TTL: 120 minutes = 7200 seconds.
-    assert_eq!(body["token_ttl_seconds"], 7200);
+    // Default TTL: 14 days = 1,209,600 seconds.
+    assert_eq!(body["token_ttl_seconds"], 14 * 24 * 60 * 60);
 }
 
 #[tokio::test]
@@ -1120,6 +1120,7 @@ async fn test_token_status_helper() {
         project_token_hash: "x".into(),
         env_mappings: "{}".into(),
         namespace: "default".into(),
+        scope: "[]".into(),
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),
         token_expires_at: Some(
@@ -1300,6 +1301,116 @@ async fn test_namespace_in_use_blocks_delete() {
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_honey_token_access_revokes_project_token() {
+    let app = setup_test_app().await;
+
+    // Register an agent and a regular + honey secret in the default namespace.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/agents")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"agent_id": "honey-agent", "jwt_secret": "honey-secret"}).to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    for body in [
+        json!({"key_path": "real_key", "secret_type": "KEY_VALUE", "value": "v"}),
+        json!({"key_path": "fake_aws_root", "secret_type": "KEY_VALUE", "value": "AKIA-FAKE", "is_honey_token": true}),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/secrets")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let auth_proof = make_agent_jwt("honey-agent", "honey-secret");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "honey-agent",
+                "auth_proof": auth_proof,
+                "context": {"project_name": "honey-proj", "file_content": "REAL_KEY=\nFAKE_AWS_ROOT="}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body = body_json(resp.into_body()).await;
+    let token = body["project_token"].as_str().unwrap().to_string();
+
+    // First read should trigger the honey-token alarm and revoke the token.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/honey-proj")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Second read should now fail with token_revoked.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/honey-proj")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["error_code"], "token_revoked");
+}
+
+#[tokio::test]
+async fn test_audit_log_chain_mac_populated() {
+    let app = setup_test_app().await;
+
+    // Generate one audit row by creating a secret.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"key_path": "k", "secret_type": "KEY_VALUE", "value": "v"}).to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/audit-logs")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let logs: Vec<Value> =
+        serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    let create_row = logs
+        .iter()
+        .find(|r| r["action"] == "create_secret")
+        .expect("audit row for create_secret");
+    assert!(
+        create_row["entry_mac"].as_str().is_some(),
+        "entry_mac column must be populated for chained-MAC audit log"
+    );
+    assert!(create_row["prev_hash"].as_str().is_some());
 }
 
 #[tokio::test]

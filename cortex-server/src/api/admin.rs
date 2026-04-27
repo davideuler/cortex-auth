@@ -54,7 +54,7 @@ fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError
 }
 
 const SECRET_SELECT: &str =
-    "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, created_at, updated_at FROM secrets";
+    "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT: &str =
     "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
 
@@ -86,6 +86,7 @@ async fn list_secrets(
             secret_type: s.secret_type,
             description: s.description,
             namespace: s.namespace,
+            is_honey_token: s.is_honey_token != 0,
             created_at: s.created_at,
         })
         .collect();
@@ -114,7 +115,7 @@ async fn create_secret(
     let envelope = crypto::seal_envelope(&req.value, &state.kek).map_err(AppError::Internal)?;
 
     sqlx::query(
-        "INSERT INTO secrets (id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace) VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+        "INSERT INTO secrets (id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&req.key_path)
@@ -123,6 +124,7 @@ async fn create_secret(
     .bind(&envelope.wrapped_dek)
     .bind(&req.description)
     .bind(&namespace)
+    .bind(if req.is_honey_token { 1_i64 } else { 0_i64 })
     .execute(&state.pool)
     .await
     .map_err(|e| {
@@ -181,6 +183,7 @@ async fn get_secret(
         value,
         description: secret.description,
         namespace: secret.namespace,
+        is_honey_token: secret.is_honey_token != 0,
         created_at: secret.created_at,
         updated_at: secret.updated_at,
     }))
@@ -216,13 +219,19 @@ async fn update_secret(
     };
 
     let new_description = req.description.or(existing.description);
+    let new_honey: i64 = match req.is_honey_token {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => existing.is_honey_token,
+    };
 
     sqlx::query(
-        "UPDATE secrets SET encrypted_value = ?, wrapped_dek = ?, description = ?, updated_at = datetime('now') WHERE id = ?",
+        "UPDATE secrets SET encrypted_value = ?, wrapped_dek = ?, description = ?, is_honey_token = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&new_body)
     .bind(&new_wrapped)
     .bind(&new_description)
+    .bind(new_honey)
     .bind(&id)
     .execute(&state.pool)
     .await?;
@@ -460,7 +469,7 @@ async fn list_projects(
     check_admin_token(&headers, &state.config.admin_token)?;
 
     let rows = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at, token_expires_at, token_revoked_at FROM projects ORDER BY created_at",
+        "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects ORDER BY created_at",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -472,6 +481,7 @@ async fn list_projects(
             project_name: p.project_name.clone(),
             env_mappings: p.get_env_mappings(),
             namespace: p.namespace.clone(),
+            scope: p.get_scope(),
             created_at: p.created_at.clone(),
             token_expires_at: p.token_expires_at.clone(),
             token_revoked_at: p.token_revoked_at.clone(),
@@ -632,7 +642,10 @@ async fn list_audit_logs(
     check_admin_token(&headers, &state.config.admin_token)?;
 
     let logs = sqlx::query_as::<_, AuditLog>(
-        "SELECT id, agent_id, project_name, action, resource_path, status, timestamp FROM audit_logs ORDER BY timestamp DESC LIMIT 1000",
+        "SELECT id, agent_id, project_name, action, resource_path, status, timestamp, \
+                caller_pid, caller_binary_sha256, caller_argv_hash, caller_cwd, caller_git_commit, \
+                source_ip, hostname, os, prev_hash, entry_mac \
+         FROM audit_logs ORDER BY timestamp DESC LIMIT 1000",
     )
     .fetch_all(&state.pool)
     .await?;

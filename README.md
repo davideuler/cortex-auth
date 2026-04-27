@@ -51,7 +51,7 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 ## Agent Key Management Principles
 
 - **Agents never touch secret values** — secrets flow directly from `cortex-server` into the process environment via `exec()`; agent code never reads or stores them
-- **No human intervention per task** — agents autonomously obtain and inject secrets across any number of projects and tasks without requiring manual input for each run
+- **No human intervention per task** — agents autonomously obtain and inject secrets across any number of projects and tasks without requiring manual input for each run (except first-time project secrets access approval)
 - **Fully autonomous secret injection** — unattended agent pipelines retrieve all required credentials on demand at runtime; no operator in the loop
 - **Secrets never written to disk** — API keys, database credentials, tokens, and passwords exist only in process memory as environment variables; nothing is persisted to files
 
@@ -282,6 +282,47 @@ curl -X POST http://localhost:3000/admin/secrets \
 The `default` namespace is created automatically and cannot be deleted. A namespace that still
 owns secrets/agents/projects refuses deletion.
 
+### Scoped project tokens
+
+Each `project_token` carries an explicit **scope** — the set of `key_path`s the
+caller is allowed to read. The scope is computed from the `.env` file the
+agent submits to `/agent/discover` and frozen on the `projects` row at issue
+time. `/project/secrets` filters its response to that frozen scope, so a leaked
+token can only ever read the secrets it was originally minted for. The default
+TTL is **14 days** (1209600 seconds); admins can revoke the token early via
+`POST /admin/projects/<name>/revoke`.
+
+### Honey tokens
+
+Mark a secret as a decoy at create time:
+
+```bash
+curl -X POST http://localhost:3000/admin/secrets \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"key_path":"legacy_aws_root_key","secret_type":"KEY_VALUE",
+       "value":"AKIA-FAKE-DO-NOT-USE","is_honey_token":true}'
+```
+
+A honey-token is never returned to a legitimate caller. Any read attempt is a
+100% attack signal: the calling project's token is **revoked immediately**, an
+`alarm`-status row is written to the audit log, and the response is a generic
+401 (the caller cannot tell whether the secret exists or is a decoy).
+
+### Tamper-evident audit log
+
+Every audit row is HMAC-SHA256 chained to the previous row using a key derived
+from the KEK (HKDF-style, fixed domain separator). Each row stores
+`prev_hash || entry_mac`; the running tail MAC lives in `audit_mac_state`.
+Any deletion, re-order, or rewrite of an audit row breaks the chain and is
+detectable by replaying entries.
+
+Rows also record optional caller metadata (`caller_pid`,
+`caller_binary_sha256`, `caller_argv_hash`, `caller_cwd`, `caller_git_commit`,
+`source_ip`, `hostname`, `os`) populated from `X-Cortex-Caller-*` request
+headers. Missing fields stay NULL — the chain MAC covers them either way.
+
+Audit logs are auto-deleted after 60 days.
+
 ### Other guarantees
 
 - AES-256-GCM with a unique nonce per write for both DEK→body and KEK→DEK steps
@@ -289,6 +330,15 @@ owns secrets/agents/projects refuses deletion.
 - Admin operations protected by static `ADMIN_TOKEN`
 - `/agent/discover` authenticates agents directly via signed JWT (no separate session token)
 - Project access via one-time-issued `project_token` (must be saved — cannot be recovered)
-- Full audit log of all secret accesses
 - `cortex-cli` uses `exec()` — secrets never visible to a parent process
 - KEK rotation: `POST /admin/rotate-key {"new_kek_password": "..."}` re-wraps every DEK with the new KEK and bumps `kek_version`. Body ciphertexts are untouched.
+- TLS terminated in-process when `TLS_CERT_FILE` + `TLS_KEY_FILE` are set (rustls)
+
+### Roadmap toward the full design
+
+The current build covers envelope encryption, namespaces, scoped tokens,
+honey tokens, and tamper-evident audit logs. The full design also calls for
+Ed25519 agent identity, signed Ed25519 project tokens, daemon attestation,
+the OAuth 2.0 device-authorization flow, and Shamir m-of-n unseal recovery.
+These are tracked in [docs/UNCERTAINTIES.md](docs/UNCERTAINTIES.md) and
+[UPDATED_DESIGN.md](UPDATED_DESIGN.md).

@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Default project token lifetime in minutes (120 minutes = 2 hours).
-pub const DEFAULT_TOKEN_TTL_MINUTES: i64 = 120;
+/// Default project token lifetime in minutes (14 days = 20160 minutes).
+/// Project tokens carry an explicit scope, so a longer lifetime is acceptable
+/// — the blast radius of a leaked token is bounded by the scope.
+pub const DEFAULT_TOKEN_TTL_MINUTES: i64 = 14 * 24 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Project {
@@ -11,6 +13,11 @@ pub struct Project {
     pub project_token_hash: String,
     pub env_mappings: String,
     pub namespace: String,
+    /// JSON array of secret key_paths the token is allowed to read. The
+    /// /agent/discover handler computes the scope from the .env file the
+    /// caller submits and freezes it on the row; later /project/secrets
+    /// requests filter their result to this scope.
+    pub scope: String,
     pub created_at: String,
     pub updated_at: String,
     pub token_expires_at: Option<String>,
@@ -40,6 +47,8 @@ pub struct DiscoverResponse {
     pub token_ttl_seconds: i64,
     pub unmatched_keys: Vec<String>,
     pub namespace: String,
+    /// Secret key_paths this project_token is allowed to read.
+    pub scope: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +62,7 @@ pub struct ProjectListItem {
     pub project_name: String,
     pub env_mappings: HashMap<String, String>,
     pub namespace: String,
+    pub scope: Vec<String>,
     pub created_at: String,
     pub token_expires_at: Option<String>,
     pub token_revoked_at: Option<String>,
@@ -62,6 +72,10 @@ pub struct ProjectListItem {
 impl Project {
     pub fn get_env_mappings(&self) -> HashMap<String, String> {
         serde_json::from_str(&self.env_mappings).unwrap_or_default()
+    }
+
+    pub fn get_scope(&self) -> Vec<String> {
+        serde_json::from_str(&self.scope).unwrap_or_default()
     }
 
     /// Returns one of: "active", "expired", "revoked".
