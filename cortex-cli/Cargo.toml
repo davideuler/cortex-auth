@@ -7,6 +7,10 @@ edition = "2021"
 name = "cortex-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "cortex-daemon"
+path = "src/daemon.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -19,3 +23,7 @@ jsonwebtoken = "9"
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = "0.6"
+base64 = "0.22"
+rpassword = "7"

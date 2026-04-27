@@ -281,6 +281,225 @@ The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its environme
 
 ---
 
+## Ed25519 Agent Identity (#13)
+
+Generate a fresh keypair locally:
+
+```bash
+cortex-cli gen-key --agent-id my-agent
+# stdout: <base64url public key>
+# private key persisted at ~/.cortex/agent-my-agent.key (mode 0600)
+```
+
+Register the agent with that public key (no shared HMAC secret needed):
+
+```bash
+curl -X POST http://localhost:3000/admin/agents \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"agent_id":"my-agent","agent_pub":"<base64url-pubkey>"}'
+```
+
+Sign an `auth_proof` and call `/agent/discover`:
+
+```bash
+PROOF=$(cortex-cli sign-proof --agent-id my-agent --priv-key-file ~/.cortex/agent-my-agent.key)
+TS=$(echo $PROOF | jq -r .ts)
+NONCE=$(echo $PROOF | jq -r .nonce)
+SIG=$(echo $PROOF | jq -r .auth_proof)
+
+curl -X POST http://localhost:3000/agent/discover \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"agent_id\": \"my-agent\",
+    \"auth_proof\": \"$SIG\",
+    \"ts\": $TS,
+    \"nonce\": \"$NONCE\",
+    \"context\": {\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"},
+    \"signed_token\": true
+  }"
+```
+
+The response carries both the legacy random `project_token` and the EdDSA
+JWT `signed_project_token`. Pass either to `cortex-cli run --token …`.
+
+---
+
+## Ed25519-Signed Project Tokens (#14)
+
+Pass `signed_token: true` to `/agent/discover` to receive an EdDSA JWT in
+`signed_project_token`. The token claims are:
+
+```json
+{
+  "iss": "cortex-auth", "sub": "<project_name>", "aud": "cortex-cli",
+  "iat": 1714248000, "exp": 1715457600,
+  "jti": "<uuid>", "scope": ["openai_api_key"],
+  "namespace": "default", "project_id": "<project_name>"
+}
+```
+
+Verifiers fetch the server public key from:
+
+```bash
+curl http://localhost:3000/.well-known/jwks.json
+# { "keys": [ { "kty":"OKP", "crv":"Ed25519", "kid":"...", "x":"...", "alg":"EdDSA" } ] }
+```
+
+The `kid` header on the JWT identifies which JWKS entry to verify against —
+old tokens stay verifiable across server keypair rotations.
+
+---
+
+## Notification Channels (#12 / #15)
+
+Honey-token alarms and Shamir recovery boots fan out to every enabled
+notification channel.
+
+### Slack / Discord (incoming webhook)
+
+```bash
+curl -X POST http://localhost:3000/admin/notification-channels \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{
+    "name": "on-call-slack",
+    "channel_type": "slack",
+    "config": {"webhook_url": "https://hooks.slack.com/services/T/B/..."}
+  }'
+```
+
+(Discord is the same with `"channel_type": "discord"` and a Discord webhook
+URL.)
+
+### Telegram (Bot API)
+
+```bash
+curl -X POST http://localhost:3000/admin/notification-channels \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{
+    "name": "ops-telegram",
+    "channel_type": "telegram",
+    "config": {"bot_token": "123456:ABC-DEF...", "chat_id": "-1001234567890"}
+  }'
+```
+
+### Email via himalaya-cli
+
+`himalaya-cli` must be installed and configured on the cortex-server host
+(see https://pimalaya.org/himalaya/). The server pipes the message to
+`himalaya message send` on stdin.
+
+```bash
+curl -X POST http://localhost:3000/admin/notification-channels \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{
+    "name": "oncall-email",
+    "channel_type": "email",
+    "config": {"to": "oncall@example.com", "account": "default"}
+  }'
+```
+
+### Test
+
+```bash
+curl -X POST http://localhost:3000/admin/notification-channels/<id>/test \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+### Disable / delete
+
+```bash
+curl -X PUT http://localhost:3000/admin/notification-channels/<id> \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"enabled": false}'
+
+curl -X DELETE http://localhost:3000/admin/notification-channels/<id> \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+```
+
+---
+
+## Shamir m-of-n Unseal Recovery (#15)
+
+### Generate shares (one-shot, server keeps no copy)
+
+From the dashboard's `Shamir Recovery` tab, or directly:
+
+```bash
+curl -X POST http://localhost:3000/admin/shamir/generate \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"threshold": 3, "shares": 5}'
+# {
+#   "threshold": 3, "shares_count": 5,
+#   "shares": ["BASE64...", "BASE64...", ...],
+#   "warning": "Distribute these shares to operators NOW and DO NOT store them."
+# }
+```
+
+Distribute each share to a different operator. The server retains nothing.
+
+### Recovery boot
+
+When the operator password is unrecoverable:
+
+```bash
+CORTEX_RECOVERY_MODE=1 \
+CORTEX_RECOVERY_THRESHOLD=3 \
+ADMIN_TOKEN=$ADMIN_TOKEN \
+cortex-server
+# [cortex-server SEALED (RECOVERY MODE)] — awaiting Shamir shares on stdin
+#   share 1 of 3: ********
+#   share 2 of 3: ********
+#   share 3 of 3: ********
+# [cortex-server UNSEALED (kek_version=N, recovery_mode=true)]
+```
+
+Recovery boot writes an `alarm`-status row to `audit_logs`
+(`action="recovery_boot"`) and dispatches notifications to every enabled
+channel.
+
+---
+
+## cortex-daemon + Device Authorization (#16)
+
+```bash
+# 1. Start the daemon (Unix socket at ~/.cortex/agent.sock, mode 0600).
+cortex-daemon &
+
+# 2. Trigger the OAuth 2.0 device-authorization grant.
+cortex-cli daemon login --url http://localhost:3000
+# [cortex-cli] visit http://localhost:3000/device and approve user_code: ABCD-1234
+# [cortex-cli] polling…
+
+# 3. Approve from the dashboard's Devices tab (or directly):
+curl -X POST http://localhost:3000/admin/web/device/approve \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"user_code":"ABCD-1234","agent_id":"my-agent"}'
+
+# 4. The daemon now holds an EdDSA access token.
+cortex-cli daemon status
+# daemon session @ http://localhost:3000 (expires_in=2592000s)
+
+# 5. Forget the session.
+cortex-cli daemon logout
+```
+
+Direct socket protocol (one-line JSON request, one-line JSON response):
+
+```bash
+echo '{"cmd":"status"}' | nc -U ~/.cortex/agent.sock
+
+echo '{"cmd":"run","program":"python","args":["main.py"],
+       "project":"my-app","token":"<project_token>",
+       "url":"http://localhost:3000"}' | nc -U ~/.cortex/agent.sock
+```
+
+The daemon spawns the child with the secrets injected as env vars and
+returns `{"ok":true,"exit_code":N}` once it exits — the raw secret values
+never travel back over the socket.
+
+---
+
 ## Production Deployment
 
 ### Environment Variables Summary
@@ -288,15 +507,23 @@ The child process sees `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in its environme
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CORTEX_KEK_PASSWORD` | No (interactive) | KEK operator password. If unset, the server prompts on stdin. |
+| `CORTEX_RECOVERY_MODE` | No | Set to `1` to boot via Shamir share recovery instead of the password. |
+| `CORTEX_RECOVERY_THRESHOLD` | Required when `CORTEX_RECOVERY_MODE=1` | Number of shares to prompt for on stdin. |
 | `ADMIN_TOKEN` | Yes | Static token for admin API access |
 | `DATABASE_URL` | No | SQLite path (default: `sqlite://cortex-auth.db`) |
 | `PORT` | No | HTTP listen port (default: 3000) |
+| `TLS_CERT_FILE` / `TLS_KEY_FILE` | No | Enable in-process rustls TLS. |
+| `CORTEX_DAEMON_SOCK` | No (cortex-daemon) | Override the default `~/.cortex/agent.sock` path. |
 
 ### Security Checklist
 
 - [ ] Rotate the KEK periodically via `POST /admin/rotate-key` and restart with the new password
+- [ ] Generate Shamir shares once and distribute to operators (`POST /admin/shamir/generate`) so a lost password is recoverable
+- [ ] Configure at least one notification channel so honey-token alarms and recovery boots actually page someone
+- [ ] Migrate agents from HMAC `jwt_secret` to Ed25519 `agent_pub` (#13)
 - [ ] Use a strong random `ADMIN_TOKEN` (at least 32 bytes)
-- [ ] Run behind a reverse proxy with TLS (nginx, caddy)
+- [ ] Run behind a reverse proxy with TLS — or set `TLS_CERT_FILE` + `TLS_KEY_FILE` for in-process termination
 - [ ] Restrict network access to the admin port
 - [ ] Back up the SQLite database regularly
 - [ ] Pull `CORTEX_KEK_PASSWORD` and `ADMIN_TOKEN` from a secrets manager (not from `.env` on disk)
+- [ ] Set `chmod 600` on `~/.cortex/agent.sock` and `~/.cortex/agent-*.key` files (cortex-cli already does this)
