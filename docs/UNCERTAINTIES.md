@@ -114,22 +114,7 @@ radius.
 
 ---
 
-## 11. Honey Tokens (April 2026)
-
-**Resolved (basic)**. Secrets carry an `is_honey_token` boolean. A read attempt against a
-honey-token immediately:
-
-1. Revokes the calling project's token (sets `token_revoked_at`).
-2. Writes an `alarm`-status row to the audit log (`action="honey_token_access"`).
-3. Returns a generic 401 to the caller.
-
-**Open**: Outbound notifications. The current implementation logs via `tracing::warn!` and
-the audit log; it does not page on-call. Stakeholder decision needed on whether to wire a
-webhook / PagerDuty / e-mail integration.
-
----
-
-## 12. Tamper-Evident Audit Log (April 2026)
+## 11. Tamper-Evident Audit Log (April 2026)
 
 **Resolved**. Audit rows are HMAC-SHA256 chained: each row's `entry_mac` covers
 `prev_hash || canonical_payload`, with the running tail MAC stored in `audit_mac_state`.
@@ -150,6 +135,25 @@ populated from `X-Cortex-Caller-*` request headers.
   `cortex-cli run` only carry `source_ip` (when behind a proxy that sets `X-Forwarded-For`).
 
 ---
+
+## 12. Honey Tokens (April 2026)
+
+**Resolved (basic)**. Secrets carry an `is_honey_token` boolean. A read attempt against a
+honey-token immediately:
+
+1. Revokes the calling project's token (sets `token_revoked_at`).
+2. Writes an `alarm`-status row to the audit log (`action="honey_token_access"`).
+3. Returns a generic 401 to the caller.
+
+**Open**: Outbound notifications. The current implementation logs via `tracing::warn!` and
+the audit log; it does not page on-call. Stakeholder decision needed on whether to wire a
+webhook / PagerDuty / e-mail integration.
+
+Outbound notifications: 
+Also support email by himalaya if himalaya-cli available, Email desitination can be configured in the admin dashboard.
+Also could send notification to Slack, Telegram and Discord channels which is configurable in the admin dashboard.
+---
+
 
 ## 13. Ed25519 Agent Identity (deferred)
 
@@ -196,9 +200,12 @@ be reconstructed from a Shamir secret-sharing `(m, n)` set (e.g. 3-of-5). Each s
 distributed to a different operator at install time; on a recovery boot the server reads
 m shares from stdin, reconstructs the KEK, and verifies the sentinel.
 
-**Status**: NOT IMPLEMENTED. Decision needed on whether to depend on a Shamir crate
-(`sharks`, `vsss-rs`) or vendor the implementation. Also: the recovery UX (interactive
+**Status**: NOT IMPLEMENTED. Depend on a Shamir crate
+(`sharks`, `vsss-rs`) implementation. Also: the recovery UX (interactive
 prompt vs. multi-file) and audit/alarm story when the server boots in recovery mode.
+
+By interactive prompt to recover. 
+Log and send outbound notifications when server boots in recovery mode.
 
 ---
 
