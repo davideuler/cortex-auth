@@ -24,8 +24,8 @@ enum Commands {
         project: String,
 
         /// Project token for authenticating with CortexAuth.
-        /// Optional when --agent-id and --jwt-secret are provided — the CLI
-        /// will discover (and auto-rotate) the token transparently.
+        /// Optional when --agent-id and --priv-key-file are provided — the
+        /// CLI will discover (and auto-rotate) the token transparently.
         #[arg(long, env = "CORTEX_TOKEN")]
         token: Option<String>,
 
@@ -37,9 +37,11 @@ enum Commands {
         #[arg(long, env = "CORTEX_AGENT_ID")]
         agent_id: Option<String>,
 
-        /// Agent JWT secret — required with --agent-id for auto-rotation.
-        #[arg(long, env = "CORTEX_JWT_SECRET")]
-        jwt_secret: Option<String>,
+        /// Path to the agent's Ed25519 private key (base64url, 32 bytes).
+        /// Required with --agent-id for auto-rotation. Defaults to
+        /// ~/.cortex/agent-<agent_id>.key.
+        #[arg(long, env = "CORTEX_PRIV_KEY_FILE")]
+        priv_key_file: Option<PathBuf>,
 
         /// Path to .env file describing required env-var names (used by discover).
         /// Defaults to "./.env" if it exists.
@@ -54,16 +56,6 @@ enum Commands {
         /// Command and arguments to run (separated by --)
         #[arg(trailing_var_arg = true, required = true)]
         cmd: Vec<String>,
-    },
-    /// Generate an auth_proof JWT for use with /agent/discover
-    GenToken {
-        /// Agent ID registered in CortexAuth
-        #[arg(long)]
-        agent_id: String,
-
-        /// JWT secret for the agent (as registered via POST /admin/agents)
-        #[arg(long)]
-        jwt_secret: String,
     },
     /// (#13) Generate a fresh Ed25519 keypair for an agent. Prints the
     /// base64url public key (upload to CortexAuth) and writes the private key
@@ -109,9 +101,10 @@ enum Commands {
         #[arg(long, env = "CORTEX_AGENT_ID")]
         agent_id: String,
 
-        /// Agent JWT secret
-        #[arg(long, env = "CORTEX_JWT_SECRET")]
-        jwt_secret: String,
+        /// Path to the agent's Ed25519 private key (base64url, 32 bytes).
+        /// Defaults to ~/.cortex/agent-<agent_id>.key.
+        #[arg(long, env = "CORTEX_PRIV_KEY_FILE")]
+        priv_key_file: Option<PathBuf>,
 
         /// Path to .env file describing required env-var names. Defaults to "./.env".
         #[arg(long, env = "CORTEX_ENV_FILE")]
@@ -174,7 +167,7 @@ async fn main() -> Result<()> {
             token,
             url,
             agent_id,
-            jwt_secret,
+            priv_key_file,
             env_file,
             token_file,
             cmd,
@@ -198,18 +191,18 @@ async fn main() -> Result<()> {
             let secrets = match fetch_secrets(&url, &project, &current_token).await {
                 Ok(s) => s,
                 Err(FetchError::Expired) | Err(FetchError::Revoked) => {
-                    let (id, secret) = match (agent_id.as_deref(), jwt_secret.as_deref()) {
-                        (Some(id), Some(s)) => (id, s),
-                        _ => anyhow::bail!(
-                            "Project token has expired or been revoked, but auto-rotation is not configured. \
-                             Set --agent-id and --jwt-secret (or CORTEX_AGENT_ID / CORTEX_JWT_SECRET) to enable, \
-                             or re-run `cortex-cli discover` manually."
-                        ),
-                    };
+                    let id = agent_id.as_deref().ok_or_else(|| anyhow::anyhow!(
+                        "Project token has expired or been revoked, but auto-rotation is not configured. \
+                         Set --agent-id (or CORTEX_AGENT_ID) and --priv-key-file (or CORTEX_PRIV_KEY_FILE) to enable, \
+                         or re-run `cortex-cli discover` manually."
+                    ))?;
+                    let key_path = priv_key_file
+                        .clone()
+                        .unwrap_or_else(|| default_priv_key_path(id));
                     eprintln!("[cortex-cli] project token invalid; auto-rotating via /agent/discover");
                     let env_content = load_env_content(env_file.as_deref())?;
                     let resp =
-                        discover_project(&url, &project, id, secret, &env_content, true).await?;
+                        discover_project(&url, &project, id, &key_path, &env_content, true).await?;
                     write_token_file(&token_path, &resp.project_token)?;
                     eprintln!(
                         "[cortex-cli] new project token saved to {} (expires at {})",
@@ -238,11 +231,6 @@ async fn main() -> Result<()> {
             let err = command.exec();
             Err(anyhow::anyhow!("Failed to exec '{}': {}", program, err))
         }
-        Commands::GenToken { agent_id, jwt_secret } => {
-            let token = make_auth_proof(&agent_id, &jwt_secret)?;
-            println!("{}", token);
-            Ok(())
-        }
         Commands::GenKey { agent_id, priv_key_file } => {
             use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
             use ed25519_dalek::SigningKey;
@@ -265,33 +253,14 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Commands::SignProof { agent_id, priv_key_file } => {
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
-            use ed25519_dalek::{Signer, SigningKey};
-
-            let priv_b64 = std::fs::read_to_string(&priv_key_file)
-                .with_context(|| format!("Failed to read {}", priv_key_file.display()))?;
-            let priv_bytes = B64
-                .decode(priv_b64.trim().as_bytes())
-                .context("private key file must be base64url")?;
-            anyhow::ensure!(priv_bytes.len() == 32, "private key must be 32 bytes");
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&priv_bytes);
-            let signing = SigningKey::from_bytes(&arr);
-
-            let ts = chrono::Utc::now().timestamp();
-            // 16 hex chars from the system PRNG via getrandom transitively
-            // through OsRng. Avoids pulling rand into cortex-cli directly.
-            let mut nonce_bytes = [0u8; 8];
-            use rand_core::RngCore;
-            rand_core::OsRng.fill_bytes(&mut nonce_bytes);
-            let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            let message = format!("{}|{}|{}|/agent/discover", ts, nonce, agent_id);
-            let sig = signing.sign(message.as_bytes());
-            let auth_proof = B64.encode(sig.to_bytes());
-
+            let signed = sign_auth_proof(&agent_id, &priv_key_file)?;
             println!(
                 "{}",
-                serde_json::json!({"ts": ts, "nonce": nonce, "auth_proof": auth_proof})
+                serde_json::json!({
+                    "ts": signed.ts,
+                    "nonce": signed.nonce,
+                    "auth_proof": signed.auth_proof,
+                })
             );
             Ok(())
         }
@@ -306,16 +275,17 @@ async fn main() -> Result<()> {
             project,
             url,
             agent_id,
-            jwt_secret,
+            priv_key_file,
             env_file,
             regenerate,
         } => {
             let env_content = load_env_content(env_file.as_deref())?;
+            let key_path = priv_key_file.unwrap_or_else(|| default_priv_key_path(&agent_id));
             let resp = discover_project(
                 &url,
                 &project,
                 &agent_id,
-                &jwt_secret,
+                &key_path,
                 &env_content,
                 regenerate,
             )
@@ -341,27 +311,36 @@ async fn main() -> Result<()> {
     }
 }
 
-fn make_auth_proof(agent_id: &str, jwt_secret: &str) -> Result<String> {
-    use jsonwebtoken::{encode, EncodingKey, Header};
-    use serde::Serialize;
+struct SignedAuthProof {
+    ts: i64,
+    nonce: String,
+    auth_proof: String,
+}
 
-    #[derive(Serialize)]
-    struct Claims {
-        sub: String,
-        iat: u64,
-    }
+fn sign_auth_proof(agent_id: &str, priv_key_file: &std::path::Path) -> Result<SignedAuthProof> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::RngCore;
 
-    let claims = Claims {
-        sub: agent_id.to_string(),
-        iat: chrono::Utc::now().timestamp() as u64,
-    };
+    let priv_b64 = std::fs::read_to_string(priv_key_file)
+        .with_context(|| format!("Failed to read private key {}", priv_key_file.display()))?;
+    let priv_bytes = B64
+        .decode(priv_b64.trim().as_bytes())
+        .context("private key file must be base64url")?;
+    anyhow::ensure!(priv_bytes.len() == 32, "private key must be 32 bytes");
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&priv_bytes);
+    let signing = SigningKey::from_bytes(&arr);
 
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(jwt_secret.as_bytes()),
-    )
-    .context("Failed to sign JWT")
+    let ts = chrono::Utc::now().timestamp();
+    let mut nonce_bytes = [0u8; 8];
+    rand_core::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, agent_id);
+    let sig = signing.sign(message.as_bytes());
+    let auth_proof = B64.encode(sig.to_bytes());
+
+    Ok(SignedAuthProof { ts, nonce, auth_proof })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -432,16 +411,18 @@ async fn discover_project(
     base_url: &str,
     project_name: &str,
     agent_id: &str,
-    jwt_secret: &str,
+    priv_key_file: &std::path::Path,
     env_content: &str,
     regenerate: bool,
 ) -> Result<DiscoverResponse> {
-    let auth_proof = make_auth_proof(agent_id, jwt_secret)?;
+    let signed = sign_auth_proof(agent_id, priv_key_file)?;
     let url = format!("{}/agent/discover", base_url.trim_end_matches('/'));
 
     let body = serde_json::json!({
         "agent_id": agent_id,
-        "auth_proof": auth_proof,
+        "auth_proof": signed.auth_proof,
+        "ts": signed.ts,
+        "nonce": signed.nonce,
         "context": {
             "project_name": project_name,
             "file_content": env_content,

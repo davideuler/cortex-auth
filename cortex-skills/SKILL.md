@@ -39,24 +39,27 @@ Project tokens are **short-lived** to limit blast radius if a token is leaked
   `~/.cortex-token-<project>` with mode `0600`.
 
 `cortex-cli run` handles rotation transparently when `--agent-id` and
-`--jwt-secret` (or `CORTEX_AGENT_ID` / `CORTEX_JWT_SECRET`) are configured.
+`--priv-key-file` (or `CORTEX_AGENT_ID` / `CORTEX_PRIV_KEY_FILE`) are configured.
 
 ## What you need from the human (one-time setup)
 
 Before you can operate autonomously, a human admin must have:
 1. Started the Cortex server and given you its URL (`CORTEX_URL`)
-2. Registered you as an agent and given you an `AGENT_ID` and `JWT_SECRET`
+2. Generated an Ed25519 keypair on this machine via
+   `cortex-cli gen-key --agent-id <id>` and uploaded the public key with
+   `POST /admin/agents`. The private key stays locally at
+   `~/.cortex/agent-<id>.key` (mode 0600) and is never sent over the wire.
 3. Stored the required secrets in Cortex (e.g., `OPENAI_API_KEY`, `SMTP_PASSWORD`)
 
-These three values — `CORTEX_URL`, `AGENT_ID`, `JWT_SECRET` — are the **only** things
-you need from a human. Everything else is autonomous.
+These values — `CORTEX_URL`, `CORTEX_AGENT_ID`, plus the local private key file —
+are the **only** things you need from a human. Everything else is autonomous.
 
 Store them in a local credentials file so future sessions don't need to ask again:
 ```
 ~/.cortex-credentials
 CORTEX_URL=http://your-server:3000
 CORTEX_AGENT_ID=agent-claude-01
-CORTEX_JWT_SECRET=<hex-secret-from-admin>
+CORTEX_PRIV_KEY_FILE=/home/you/.cortex/agent-agent-claude-01.key
 ```
 
 Load them at the start of each session:
@@ -65,7 +68,7 @@ source ~/.cortex-credentials
 # or export individually:
 export CORTEX_URL=http://your-server:3000
 export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_JWT_SECRET=<secret>
+export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
 ```
 
 ## Recommended path: let cortex-cli handle the lifecycle
@@ -76,7 +79,7 @@ first use, persist it, and auto-rotate it whenever it expires or is revoked:
 ```bash
 export CORTEX_URL=http://your-server:3000
 export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_JWT_SECRET=<secret>
+export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
 export CORTEX_PROJECT=my-project
 
 cortex-cli run -- python app.py
@@ -93,15 +96,19 @@ the 120-minute mark.
 
 ## Step-by-step: manual flow (for scripts and curl)
 
-### Step 1 — Generate your auth proof (no network call)
+### Step 1 — Sign your auth proof (no network call)
 
-The auth proof is a JWT you create locally using your `JWT_SECRET`. It proves
-your identity to the Cortex server without storing any session state.
+The auth proof is an Ed25519 signature you create locally with your private
+key. It proves your identity to the Cortex server without storing any session
+state.
 
 ```bash
-AUTH_PROOF=$(cortex-cli gen-token \
+PROOF=$(cortex-cli sign-proof \
   --agent-id "$CORTEX_AGENT_ID" \
-  --jwt-secret "$CORTEX_JWT_SECRET")
+  --priv-key-file "$CORTEX_PRIV_KEY_FILE")
+TS=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['ts'])")
+NONCE=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['nonce'])")
+AUTH_PROOF=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_proof'])")
 ```
 
 This command runs entirely offline — no server needed.
@@ -123,6 +130,8 @@ RESPONSE=$(curl -s -X POST "$CORTEX_URL/agent/discover" \
   -d "{
     \"agent_id\": \"$CORTEX_AGENT_ID\",
     \"auth_proof\": \"$AUTH_PROOF\",
+    \"ts\": $TS,
+    \"nonce\": \"$NONCE\",
     \"context\": {
       \"project_name\": \"my-project\",
       \"file_content\": \"$ENV_CONTENT\"
@@ -173,9 +182,9 @@ Or use environment variables and let the CLI pick up the saved token:
 ```bash
 export CORTEX_PROJECT=my-project
 export CORTEX_URL=http://your-server:3000
-# CORTEX_AGENT_ID + CORTEX_JWT_SECRET enable transparent auto-rotation
+# CORTEX_AGENT_ID + CORTEX_PRIV_KEY_FILE enable transparent auto-rotation
 export CORTEX_AGENT_ID=agent-claude-01
-export CORTEX_JWT_SECRET=<secret>
+export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-agent-claude-01.key
 
 cortex-cli run -- python app.py
 ```
@@ -201,13 +210,18 @@ when the existing token is expired or revoked, so you don't need
 `regenerate_token=true`:
 
 ```bash
-AUTH_PROOF=$(cortex-cli gen-token --agent-id "$CORTEX_AGENT_ID" --jwt-secret "$CORTEX_JWT_SECRET")
+PROOF=$(cortex-cli sign-proof --agent-id "$CORTEX_AGENT_ID" --priv-key-file "$CORTEX_PRIV_KEY_FILE")
+TS=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['ts'])")
+NONCE=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['nonce'])")
+AUTH_PROOF=$(echo "$PROOF" | python3 -c "import sys,json; print(json.load(sys.stdin)['auth_proof'])")
 
 RESPONSE=$(curl -s -X POST "$CORTEX_URL/agent/discover" \
   -H "Content-Type: application/json" \
   -d "{
     \"agent_id\": \"$CORTEX_AGENT_ID\",
     \"auth_proof\": \"$AUTH_PROOF\",
+    \"ts\": $TS,
+    \"nonce\": \"$NONCE\",
     \"context\": {
       \"project_name\": \"my-project\",
       \"file_content\": \"$(cat .env 2>/dev/null)\"
@@ -282,7 +296,7 @@ PROJECT_NAME="${1:-my-project}"
 [ -f "$CORTEX_CREDS" ] && source "$CORTEX_CREDS"
 
 export CORTEX_PROJECT="$PROJECT_NAME"
-# CORTEX_AGENT_ID, CORTEX_JWT_SECRET, CORTEX_URL come from ~/.cortex-credentials
+# CORTEX_AGENT_ID, CORTEX_PRIV_KEY_FILE, CORTEX_URL come from ~/.cortex-credentials
 
 # Ensure a token exists; cortex-cli run will auto-rotate if it has expired.
 if [ ! -f "${HOME}/.cortex-token-${PROJECT_NAME}" ]; then
@@ -299,7 +313,7 @@ Usage: `bash cortex-bootstrap.sh my-project python app.py`
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | `cortex-cli: command not found` | CLI not installed or not in PATH | Build with `cargo build --release`; add `target/release` to PATH |
-| 401 on discover | Invalid `AGENT_ID` or `JWT_SECRET` | Verify credentials with admin |
+| 401 on discover | Invalid `AGENT_ID` or wrong/missing private key file | Verify the agent is registered and the private key matches the uploaded `agent_pub` |
 | 409 on discover | Project token still active | Wait for expiry, or pass `regenerate_token: true` |
 | 401 with `error_code: token_expired` | Token older than 120min | Re-run discover (auto-rotates) or use `cortex-cli run` with agent creds |
 | 401 with `error_code: token_revoked` | Admin revoked the token | Re-run discover; if it keeps happening, ask admin why |
@@ -310,7 +324,8 @@ Usage: `bash cortex-bootstrap.sh my-project python app.py`
 
 - `cortex-cli run` uses `exec()` — secrets are never visible in the shell or process list.
 - Project tokens expire after 120 minutes; never extend this in production code.
-- Never print or log `PROJECT_TOKEN` or `JWT_SECRET`.
+- Never print or log `PROJECT_TOKEN`. Keep the agent private key file
+  (`~/.cortex/agent-<id>.key`) at `chmod 600`.
 - Token files should be `chmod 600` (the CLI sets this automatically).
 - On suspected token leak: revoke via the admin API and re-discover.
 

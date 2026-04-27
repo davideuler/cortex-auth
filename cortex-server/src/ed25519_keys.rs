@@ -167,8 +167,7 @@ pub fn verify_jwt<C: for<'de> Deserialize<'de>>(
 }
 
 /// Verify an Ed25519 signature using a public key registered for an agent
-/// (#13). Used to authenticate `/agent/discover` when the agent uploaded
-/// `agent_pub` instead of (or in addition to) the legacy HMAC `jwt_secret`.
+/// (#13). Used to authenticate `/agent/discover`.
 pub fn verify_agent_signature(
     agent_pub_b64: &str,
     message: &[u8],

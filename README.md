@@ -21,10 +21,10 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
   │                Agent              │                        │
   │         (autonomous pipeline)     │                        │
   │                                   ▼                        │
-  │  ① cortex-cli gen-token  ┌─────────────────┐              │
+  │  ① cortex-cli sign-proof ┌─────────────────┐              │
   │  ──────────────────────► │   cortex-cli    │              │
   │                          │                 │              │
-  │  ④ cortex-cli run        │  gen-token      │              │
+  │  ④ cortex-cli run        │  sign-proof     │              │
   │  ──────────────────────► │  run → exec()   │              │
   └──────────────────────────┴────────┬────────┘──────────────┘
                                       │
@@ -44,7 +44,7 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 
 **Flow:**
 1. **Admin** pre-loads project secrets into `cortex-server` via the admin API
-2. **Agent** calls `cortex-cli gen-token` to sign a JWT (`auth_proof`) proving its identity
+2. **Agent** calls `cortex-cli sign-proof` to produce an Ed25519 `auth_proof` proving its identity, signed locally with `~/.cortex/agent-<id>.key`
 3. **Agent** posts `auth_proof` to `/agent/discover` → receives a `project_token`
 4. **Agent** calls `cortex-cli run --project <name> --token <project_token>` which fetches secrets from the server and `exec()`s the target process with them injected as environment variables
 
@@ -131,11 +131,14 @@ curl -X POST http://localhost:3000/admin/secrets \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-your-key"}'
 
-# Discover project secrets (authenticate with agent_id + signed JWT)
-AUTH_PROOF=$(cortex-cli gen-token --agent-id my-agent --jwt-secret <agent_jwt_secret>)
+# Discover project secrets (authenticate with agent_id + Ed25519 signature).
+# `cortex-cli sign-proof` reads ~/.cortex/agent-<id>.key created by
+# `cortex-cli gen-key` and prints {"ts","nonce","auth_proof"}.
+PROOF=$(cortex-cli sign-proof --agent-id my-agent \
+  --priv-key-file ~/.cortex/agent-my-agent.key)
 curl -X POST http://localhost:3000/agent/discover \
   -H "Content-Type: application/json" \
-  -d "{\"agent_id\":\"my-agent\",\"auth_proof\":\"$AUTH_PROOF\",\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
+  -d "{\"agent_id\":\"my-agent\",$(echo $PROOF | tr -d '{}'),\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
 # Save the returned project_token!
 
 # Launch your app with secrets injected
@@ -328,10 +331,10 @@ leaks nothing about who gets paged.
 
 ### Ed25519 agent identity (#13)
 
-Agents may register an **Ed25519 public key** in addition to (or instead of)
-the legacy HMAC `jwt_secret`. The agent generates the keypair locally with
-`cortex-cli gen-key`, uploads only the public key, and proves identity at
-`/agent/discover` by signing `ts | nonce | agent_id | /agent/discover`:
+Every agent authenticates with an **Ed25519 public key**. The agent generates
+the keypair locally with `cortex-cli gen-key`, uploads only the public key,
+and proves identity at `/agent/discover` by signing
+`ts | nonce | agent_id | /agent/discover`:
 
 ```bash
 # 1. Generate a keypair (private key persisted at ~/.cortex/agent-<id>.key, mode 0600)
@@ -348,10 +351,9 @@ cortex-cli sign-proof --agent-id my-agent --priv-key-file ~/.cortex/agent-my-age
 # stdout: {"ts":1714248000,"nonce":"...","auth_proof":"<base64url-sig>"}
 ```
 
-Agents registered with `agent_pub` use the Ed25519 path on `/agent/discover`;
-agents registered with only `jwt_secret` continue to use HMAC-SHA256 JWTs
-unchanged. Replay protection: the request `ts` must be within ±5 minutes of
-the server clock.
+Replay protection: the request `ts` must be within ±5 minutes of the server
+clock. The private key never leaves the agent's machine — a DB compromise
+exposes only public keys.
 
 ### Ed25519-signed project tokens (#14)
 

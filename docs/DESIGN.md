@@ -79,14 +79,10 @@ Axum HTTP service backed by SQLite via sqlx.
 #### Authentication Model
 - **Admin operations**: static `X-Admin-Token` header (single-shared-secret
   today; per-user RBAC tracked in UNCERTAINTIES #18).
-- **Agent discover**: two paths gated by the agent's stored credential
-  shape:
-  1. **Ed25519 (#13)** — when the agent row has an `agent_pub` column, the
-     `auth_proof` is an Ed25519 signature over
-     `ts | nonce | agent_id | /agent/discover`. `ts` must be within ±5
-     minutes of the server clock.
-  2. **HMAC-SHA256 JWT** — legacy path. The agent's `jwt_secret` is stored
-     envelope-encrypted; the server decrypts it and verifies the JWT.
+- **Agent discover (#13)**: every agent registers an Ed25519 `agent_pub`.
+  The `auth_proof` is an Ed25519 signature over
+  `ts | nonce | agent_id | /agent/discover`; `ts` must be within ±5 minutes
+  of the server clock.
 - **Project access**: two formats accepted on `/project/*`:
   1. **Hashed random token** — 32 random bytes hex-encoded; SHA-256 hashed
      at rest. This is the default returned by `/agent/discover`.
@@ -158,7 +154,6 @@ Axum HTTP service backed by SQLite via sqlx.
 - **cortex-cli run** — fetches `/project/secrets/<name>` and `exec()`s the
   child with the env vars injected. The CLI process is *replaced* by the
   child, so a parent process cannot scrape the env from the CLI's pid.
-- **cortex-cli gen-token** — legacy HS256 auth_proof.
 - **cortex-cli gen-key** — generates an Ed25519 keypair locally; private
   key is mode 0600 in `~/.cortex/agent-<id>.key`.
 - **cortex-cli sign-proof** — signs an Ed25519 auth_proof with the local
@@ -220,8 +215,8 @@ CORTEX_RECOVERY_MODE=1 CORTEX_RECOVERY_THRESHOLD=3 cortex-server
 secrets              (id, key_path, secret_type, encrypted_value, wrapped_dek,
                       kek_version, description, namespace, is_honey_token,
                       created_at, updated_at)
-agents               (id, agent_id, jwt_secret_encrypted, wrapped_dek,
-                      kek_version, description, namespace, agent_pub, created_at)
+agents               (id, agent_id, agent_pub, description, namespace,
+                      created_at)
 policies             (id, policy_name, agent_pattern, allowed_paths,
                       denied_paths, created_at)
 projects             (id, project_name, project_token_hash, env_mappings,
@@ -247,13 +242,16 @@ revoked_token_jti    (jti, revoked_at)
 
 ## Security Properties
 
-- All secrets, agent jwt_secrets, notification channel configs, and the
-  server signing key are AES-256-GCM-encrypted under per-row DEKs wrapped
-  by the in-memory KEK.
+- All secrets, notification channel configs, and the server signing key
+  are AES-256-GCM-encrypted under per-row DEKs wrapped by the in-memory
+  KEK. Agent identity is established via Ed25519 public keys — the server
+  stores no agent-side secret, so a DB compromise cannot impersonate an
+  agent.
 - KEK is derived with Argon2id from the operator password (or reconstructed
   from Shamir shares in recovery mode); never persisted to disk.
-- Project tokens: SHA-256 hashed (legacy random) OR EdDSA-signed JWT (new).
-  Constant-time comparison via `subtle::ConstantTimeEq`.
+- Project tokens: SHA-256 hashed random tokens, or EdDSA-signed JWTs when
+  the caller passes `signed_token: true`. Constant-time comparison via
+  `subtle::ConstantTimeEq`.
 - Audit log is HMAC-SHA256-chained — tampering is detectable.
 - `cortex-cli` uses `exec()`; the parent process is *replaced*.
 - `cortex-daemon` keeps the access token in its own process; peers cannot

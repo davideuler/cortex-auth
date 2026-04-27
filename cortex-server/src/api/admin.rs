@@ -78,7 +78,7 @@ fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError
 const SECRET_SELECT: &str =
     "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT: &str =
-    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at, agent_pub FROM agents";
+    "SELECT id, agent_id, description, namespace, created_at, agent_pub FROM agents";
 
 async fn ensure_namespace_exists(state: &AppState, name: &str) -> Result<(), AppError> {
     sqlx::query("INSERT OR IGNORE INTO namespaces (name) VALUES (?)")
@@ -324,7 +324,7 @@ async fn list_agents(
             description: a.description,
             namespace: a.namespace,
             created_at: a.created_at,
-            has_pubkey: a.agent_pub.is_some(),
+            has_pubkey: !a.agent_pub.is_empty(),
         })
         .collect();
 
@@ -338,9 +338,9 @@ async fn create_agent(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     check_admin_token(&headers, &state.config.admin_token)?;
 
-    if req.jwt_secret.is_none() && req.agent_pub.is_none() {
+    if req.agent_pub.trim().is_empty() {
         return Err(AppError::BadRequest(
-            "Provide either jwt_secret (HMAC, legacy) or agent_pub (Ed25519, preferred)".into(),
+            "agent_pub (base64url-encoded Ed25519 public key) is required".into(),
         ));
     }
 
@@ -348,22 +348,12 @@ async fn create_agent(
     ensure_namespace_exists(&state, &namespace).await?;
 
     let id = Uuid::new_v4().to_string();
-    // Store an HMAC secret if supplied; fall back to a random unused string
-    // when only an Ed25519 pub key was uploaded so the column stays NOT NULL.
-    let jwt_secret_plaintext = req
-        .jwt_secret
-        .clone()
-        .unwrap_or_else(|| format!("ed25519-only:{}", Uuid::new_v4()));
-    let envelope =
-        crypto::seal_envelope(&jwt_secret_plaintext, &state.kek).map_err(AppError::Internal)?;
 
     sqlx::query(
-        "INSERT INTO agents (id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, agent_pub) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+        "INSERT INTO agents (id, agent_id, description, namespace, agent_pub) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&req.agent_id)
-    .bind(&envelope.body_ciphertext)
-    .bind(&envelope.wrapped_dek)
     .bind(&req.description)
     .bind(&namespace)
     .bind(&req.agent_pub)
@@ -716,9 +706,6 @@ async fn rotate_key(
     let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(SECRET_SELECT)
         .fetch_all(&state.pool)
         .await?;
-    let agents = sqlx::query_as::<_, crate::models::agent::Agent>(AGENT_SELECT)
-        .fetch_all(&state.pool)
-        .await?;
 
     let new_kek_version: i64 = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE((SELECT kek_version FROM kek_metadata WHERE id = 1), 1) + 1",
@@ -747,25 +734,6 @@ async fn rotate_key(
         .await?;
     }
 
-    for a in &agents {
-        let wrapped = a
-            .wrapped_dek
-            .as_deref()
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
-        let plaintext = crypto::open_envelope(&a.jwt_secret_encrypted, wrapped, &state.kek)
-            .map_err(AppError::Internal)?;
-        let env = crypto::seal_envelope(&plaintext, &new_kek).map_err(AppError::Internal)?;
-        sqlx::query(
-            "UPDATE agents SET jwt_secret_encrypted = ?, wrapped_dek = ?, kek_version = ? WHERE id = ?",
-        )
-        .bind(&env.body_ciphertext)
-        .bind(&env.wrapped_dek)
-        .bind(new_kek_version)
-        .bind(&a.id)
-        .execute(&mut *tx)
-        .await?;
-    }
-
     let new_sentinel = crypto::seal_sentinel(&new_kek).map_err(AppError::Internal)?;
     let new_salt_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &new_salt);
     sqlx::query(
@@ -784,7 +752,6 @@ async fn rotate_key(
     Ok(Json(json!({
         "rotated": true,
         "secrets_rewrapped": secrets.len(),
-        "agents_rewrapped": agents.len(),
         "new_kek_version": new_kek_version,
         "message": "KEK rotated. Restart the server with the NEW operator password to reload the KEK into memory."
     })))
