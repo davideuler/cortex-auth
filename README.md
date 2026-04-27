@@ -54,6 +54,7 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 - **No human intervention per task** — agents autonomously obtain and inject secrets across any number of projects and tasks without requiring manual input for each run (except first-time project secrets access approval)
 - **Fully autonomous secret injection** — unattended agent pipelines retrieve all required credentials on demand at runtime; no operator in the loop
 - **Secrets never written to disk** — API keys, database credentials, tokens, and passwords exist only in process memory as environment variables; nothing is persisted to files
+- **Daemon mode for AI-on-the-same-UID isolation** — `cortex-daemon` (#16) holds the agent's Ed25519 private key in its own process and exposes a Unix socket (`~/.cortex/agent.sock`) where peers can request `run`/`inject_template` operations but cannot extract raw secret material
 
 ## Installation
 
@@ -305,8 +306,118 @@ curl -X POST http://localhost:3000/admin/secrets \
 
 A honey-token is never returned to a legitimate caller. Any read attempt is a
 100% attack signal: the calling project's token is **revoked immediately**, an
-`alarm`-status row is written to the audit log, and the response is a generic
-401 (the caller cannot tell whether the secret exists or is a decoy).
+`alarm`-status row is written to the audit log, the response is a generic
+401, and an outbound notification is dispatched to every enabled channel
+(see below).
+
+### Outbound notifications (#12 / #15)
+
+Honey-token alarms and Shamir recovery boots fan out to every enabled
+**notification channel** managed under the dashboard's `Notifications` tab
+(or `POST /admin/notification-channels`):
+
+| Channel | Transport | Config |
+|---------|-----------|--------|
+| Slack | incoming webhook | `{"webhook_url":"https://hooks.slack.com/..."}` |
+| Discord | incoming webhook | `{"webhook_url":"https://discord.com/api/webhooks/..."}` |
+| Telegram | Bot API | `{"bot_token":"...","chat_id":"..."}` |
+| Email | `himalaya-cli` (when on PATH) | `{"to":"oncall@example.com","account":"..."}` |
+
+Channel configs are envelope-encrypted under the KEK, so a DB-only compromise
+leaks nothing about who gets paged.
+
+### Ed25519 agent identity (#13)
+
+Agents may register an **Ed25519 public key** in addition to (or instead of)
+the legacy HMAC `jwt_secret`. The agent generates the keypair locally with
+`cortex-cli gen-key`, uploads only the public key, and proves identity at
+`/agent/discover` by signing `ts | nonce | agent_id | /agent/discover`:
+
+```bash
+# 1. Generate a keypair (private key persisted at ~/.cortex/agent-<id>.key, mode 0600)
+cortex-cli gen-key --agent-id my-agent
+# stdout: <base64url public key>
+
+# 2. Register the agent with that public key
+curl -X POST http://localhost:3000/admin/agents \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"agent_id":"my-agent","agent_pub":"<base64url-pubkey>"}'
+
+# 3. Sign an auth_proof at run time
+cortex-cli sign-proof --agent-id my-agent --priv-key-file ~/.cortex/agent-my-agent.key
+# stdout: {"ts":1714248000,"nonce":"...","auth_proof":"<base64url-sig>"}
+```
+
+Agents registered with `agent_pub` use the Ed25519 path on `/agent/discover`;
+agents registered with only `jwt_secret` continue to use HMAC-SHA256 JWTs
+unchanged. Replay protection: the request `ts` must be within ±5 minutes of
+the server clock.
+
+### Ed25519-signed project tokens (#14)
+
+`POST /agent/discover` now accepts `signed_token: true`, which mints an
+EdDSA-signed JWT project token alongside the legacy random one:
+
+```jsonc
+{
+  "iss": "cortex-auth", "sub": "<project_name>", "aud": "cortex-cli",
+  "iat": 1714248000, "exp": 1715457600,
+  "jti": "<uuid>", "scope": ["openai_api_key", ...],
+  "namespace": "default", "project_id": "<project_name>"
+}
+```
+
+Verifiers fetch the public key from `GET /.well-known/jwks.json` (keyed by
+`kid` so old tokens stay verifiable across rotations). Revocation is
+enforced via the `revoked_token_jti` table.
+
+### Shamir m-of-n unseal recovery (#15)
+
+If the operator password is lost, the running KEK can be split into n shares
+with threshold m and reconstructed at boot. Generate shares once from the
+dashboard's `Shamir Recovery` tab (or `POST /admin/shamir/generate`) and
+distribute them to operators — the server does not retain a copy.
+
+```bash
+# Recovery boot: prompts for `threshold` shares interactively on stdin.
+CORTEX_RECOVERY_MODE=1 \
+CORTEX_RECOVERY_THRESHOLD=3 \
+ADMIN_TOKEN=$ADMIN_TOKEN \
+cortex-server
+# [cortex-server SEALED (RECOVERY MODE)] — awaiting Shamir shares on stdin
+#   share 1 of 3: ********
+#   share 2 of 3: ********
+#   share 3 of 3: ********
+```
+
+A successful recovery boot writes an `alarm`-status row to the audit log
+(`action="recovery_boot"`) and dispatches notifications to every enabled
+channel.
+
+### Device authorization & cortex-daemon (#16)
+
+A long-running `cortex-daemon` process can hold the session for an agent so
+unattended pipelines never see raw secret material. Login uses the OAuth 2.0
+Device Authorization Grant (RFC 8628):
+
+```bash
+# 1. Start the daemon (listens on ~/.cortex/agent.sock)
+cortex-daemon &
+
+# 2. Trigger device login — prints a user_code
+cortex-cli daemon login --url http://localhost:3000
+# [cortex-cli] visit http://localhost:3000/device and approve user_code: ABCD-1234
+
+# 3. An admin approves the user_code via the dashboard's `Devices` tab
+#    (or POST /admin/web/device/approve), binding it to an agent_id.
+
+# 4. The daemon now holds an Ed25519-signed access token for the agent.
+cortex-cli daemon status
+```
+
+The daemon scaffolding implements the basic socket protocol (`status` /
+`run`); full attestation and the `inject_template` / `ssh_proxy` socket
+verbs are tracked in [docs/UNCERTAINTIES.md](docs/UNCERTAINTIES.md) #17.
 
 ### Tamper-evident audit log
 
@@ -326,19 +437,24 @@ Audit logs are auto-deleted after 60 days.
 ### Other guarantees
 
 - AES-256-GCM with a unique nonce per write for both DEK→body and KEK→DEK steps
-- Project tokens hashed with SHA-256 (the raw token is never stored)
-- Admin operations protected by static `ADMIN_TOKEN`
-- `/agent/discover` authenticates agents directly via signed JWT (no separate session token)
-- Project access via one-time-issued `project_token` (must be saved — cannot be recovered)
+- Project tokens hashed with SHA-256 (the raw token is never stored). EdDSA-signed JWT tokens are also supported (#14) when the caller passes `signed_token: true` to `/agent/discover`; the server's public key is published at `GET /.well-known/jwks.json`.
+- Admin operations protected by static `ADMIN_TOKEN` (#18 multi-user RBAC tracked as deferred)
+- `/agent/discover` authenticates agents either via Ed25519 signature (#13) when an `agent_pub` is registered, or via legacy HMAC-SHA256 JWT — no separate session token issued
+- Project access via one-time-issued `project_token` (must be saved — cannot be recovered) or via the EdDSA-signed JWT alternative
 - `cortex-cli` uses `exec()` — secrets never visible to a parent process
+- `cortex-daemon` (#16) holds the session over a Unix socket so unattended pipelines never see raw secret material
 - KEK rotation: `POST /admin/rotate-key {"new_kek_password": "..."}` re-wraps every DEK with the new KEK and bumps `kek_version`. Body ciphertexts are untouched.
+- KEK recovery (#15): `CORTEX_RECOVERY_MODE=1` boots from m Shamir shares typed on stdin instead of the operator password
 - TLS terminated in-process when `TLS_CERT_FILE` + `TLS_KEY_FILE` are set (rustls)
+- Outbound notifications (#12 / #15): honey-token alarms and recovery boots fan out to Slack / Discord / Telegram / email channels managed in the dashboard
 
 ### Roadmap toward the full design
 
 The current build covers envelope encryption, namespaces, scoped tokens,
-honey tokens, and tamper-evident audit logs. The full design also calls for
-Ed25519 agent identity, signed Ed25519 project tokens, daemon attestation,
-the OAuth 2.0 device-authorization flow, and Shamir m-of-n unseal recovery.
-These are tracked in [docs/UNCERTAINTIES.md](docs/UNCERTAINTIES.md) and
-[UPDATED_DESIGN.md](UPDATED_DESIGN.md).
+honey tokens, tamper-evident audit logs, **outbound notifications**, **Ed25519
+agent identity**, **Ed25519-signed project tokens** with a JWKS endpoint,
+**Shamir m-of-n unseal recovery**, and the **OAuth 2.0 device-authorization
+flow** with a basic `cortex-daemon`. The remaining gap from
+[UPDATED_DESIGN.md](UPDATED_DESIGN.md) is daemon attestation (#17) plus the
+multi-user RBAC for admins (#18) and the verify-audit CLI (#11) — see
+[docs/UNCERTAINTIES.md](docs/UNCERTAINTIES.md).

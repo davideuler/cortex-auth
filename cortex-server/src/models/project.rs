@@ -36,6 +36,17 @@ pub struct DiscoverRequest {
     pub auth_proof: String,
     pub context: DiscoverContext,
     pub regenerate_token: Option<bool>,
+    /// (#13) When the agent was registered with `agent_pub`, the auth_proof
+    /// is interpreted as an Ed25519 signature over `ts || nonce || agent_id ||
+    /// "/agent/discover"` — these two fields carry the message inputs.
+    pub ts: Option<i64>,
+    pub nonce: Option<String>,
+    /// (#14) When set, the response includes a server-signed Ed25519 JWT
+    /// project token in `signed_project_token` alongside the legacy random
+    /// `project_token`. Both verify against the same project until the
+    /// random one is removed in a future release.
+    #[serde(default)]
+    pub signed_token: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +60,10 @@ pub struct DiscoverResponse {
     pub namespace: String,
     /// Secret key_paths this project_token is allowed to read.
     pub scope: Vec<String>,
+    /// (#14) Server-signed Ed25519 JWT project token, present iff the caller
+    /// passed `signed_token: true`. Verifies against `/.well-known/jwks.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_project_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

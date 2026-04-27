@@ -4,20 +4,20 @@
 
 ### Security
 
-1. **Enforce access policies**
-   The policy data model is stored but not applied. Wire glob-pattern matching on agent_id against stored policies when agents call `/agent/secrets` and `/agent/config`. This is the most important security gap.
+1. **Enforce access policies on legacy HMAC agents**
+   The policy data model is stored and applied at discover time (path filtering by agent pattern). Tighten this for the Ed25519 path so policy decisions are recorded on every `/project/*` call, not just at discover.
 
-2. **TLS support**
-   Add rustls-based TLS directly in the server (using `axum-server` with `rustls`), or clearly document that a TLS-terminating reverse proxy is mandatory. Secrets in transit over plain HTTP is unacceptable in production.
+2. **TLS support** *(implemented)*
+   In-process rustls TLS terminates when both `TLS_CERT_FILE` and `TLS_KEY_FILE` are set. A TLS-terminating reverse proxy remains the recommended deployment pattern.
 
 3. **Rate limiting**
-   Add per-IP rate limiting on authentication endpoints (`/agent/authenticate`, `/agent/discover`) to prevent brute-force attacks on agent JWT secrets and token enumeration.
+   Add per-IP rate limiting on authentication endpoints (`/agent/discover`, `/device/authorize`, `/device/token`) to prevent brute-force attacks on agent JWT secrets, Ed25519 nonces, and device-flow user_code enumeration.
 
-4. **Encrypt project token at rest differently**
-   Consider using a keyed HMAC (HMAC-SHA256 with a server-side key) instead of plain SHA-256 for project token hashing. This prevents offline attacks if the DB is exfiltrated.
+4. **Replay-protection for Ed25519 auth_proof**
+   The current Ed25519 path enforces a ±5-minute `ts` window but does not yet cache nonces. Add a small in-memory LRU keyed by `(agent_id, nonce)` so the same proof cannot be replayed within the window.
 
-5. **Constant-time token comparison**
-   Replace `hash_token(token) == hash` with `subtle::ConstantTimeEq` to prevent timing attacks on token verification.
+5. **Constant-time token comparison** *(implemented)*
+   Project token verification uses `subtle::ConstantTimeEq` for the SHA-256 hash compare path; the JWT path is signature-bound and not timing-attackable.
 
 ### Correctness
 
@@ -81,8 +81,20 @@
 20. **Config file watcher**
     Allow the server to reload its non-sensitive config (port, log level) from a config file on SIGHUP without restarting.
 
-21. **Plugin-based auth backends**
-    Support additional agent authentication backends beyond JWT (e.g., mTLS client certificates, GitHub Actions OIDC tokens).
+21. **Plugin-based auth backends** *(Ed25519 implemented)*
+    Ed25519 is now the preferred agent identity (#13). HMAC remains as a backwards-compat path. Beyond these: mTLS client certificates and GitHub Actions OIDC tokens.
+
+22. **Daemon attestation header (#17)**
+    The current `cortex-daemon` is *unattested* — it can run any binary version. Add a per-process `attestation_priv` registered at boot and require an `X-Daemon-Attestation` header on every request signed over `(session_id, ts, jti, method, path, body_sha256, auth_token_id)`. Server-side allowed-binary whitelist gated by binary SHA-256.
+
+23. **Multi-user RBAC for admins (#18)**
+    The single shared `ADMIN_TOKEN` is acceptable for a one-operator deployment, but production needs per-user accounts with namespace scopes, password (Argon2id) or OIDC login, and per-user audit attribution. Currently device-approval and Shamir share generation are admin-token-gated; under RBAC they should additionally require a privileged role.
+
+24. **Honey-token webhook customization (#20)**
+    Each notification channel today receives the same payload. Future work: per-channel payload templates, per-namespace channel mapping, retry/backoff, and a `severity` filter so a slack channel can opt into honey-token alarms without recovery-mode pages.
+
+25. **Verify-audit CLI (#11)**
+    `cortex-cli verify-audit --db cortex-auth.db` would walk `audit_logs` row-by-row, recompute each `entry_mac` from `prev_hash || canonical_payload`, and report any mismatch. The MAC key derivation is documented in `crypto::derive_audit_mac_key`.
 
 ---
 

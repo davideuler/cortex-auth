@@ -16,10 +16,15 @@ use crate::{
         agent::{AgentListItem, CreateAgentRequest},
         audit_log::AuditLog,
         namespace::{CreateNamespaceRequest, Namespace},
+        notification::{
+            is_valid_channel_type, CreateNotificationChannelRequest, NotificationChannel,
+            NotificationChannelListItem, UpdateNotificationChannelRequest,
+        },
         policy::{CreatePolicyRequest, PolicyDetail},
         project::ProjectListItem,
         secret::{CreateSecretRequest, SecretDetail, SecretListItem, UpdateSecretRequest},
     },
+    notifications,
     state::AppState,
 };
 
@@ -40,6 +45,23 @@ pub fn router() -> Router<AppState> {
         .route("/namespaces/:name", delete(delete_namespace))
         .route("/audit-logs", get(list_audit_logs))
         .route("/rotate-key", post(rotate_key))
+        .route(
+            "/notification-channels",
+            get(list_notification_channels).post(create_notification_channel),
+        )
+        .route(
+            "/notification-channels/:id",
+            axum::routing::put(update_notification_channel)
+                .delete(delete_notification_channel),
+        )
+        .route(
+            "/notification-channels/:id/test",
+            post(test_notification_channel),
+        )
+        .route("/shamir/generate", post(generate_shamir_shares))
+        .route("/devices", get(list_devices))
+        .route("/devices/:agent_id", delete(delete_device))
+        .route("/web/device/approve", post(web_device_approve))
 }
 
 fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError> {
@@ -56,7 +78,7 @@ fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError
 const SECRET_SELECT: &str =
     "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT: &str =
-    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
+    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at, agent_pub FROM agents";
 
 async fn ensure_namespace_exists(state: &AppState, name: &str) -> Result<(), AppError> {
     sqlx::query("INSERT OR IGNORE INTO namespaces (name) VALUES (?)")
@@ -302,6 +324,7 @@ async fn list_agents(
             description: a.description,
             namespace: a.namespace,
             created_at: a.created_at,
+            has_pubkey: a.agent_pub.is_some(),
         })
         .collect();
 
@@ -315,15 +338,27 @@ async fn create_agent(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     check_admin_token(&headers, &state.config.admin_token)?;
 
+    if req.jwt_secret.is_none() && req.agent_pub.is_none() {
+        return Err(AppError::BadRequest(
+            "Provide either jwt_secret (HMAC, legacy) or agent_pub (Ed25519, preferred)".into(),
+        ));
+    }
+
     let namespace = req.namespace.unwrap_or_else(|| "default".to_string());
     ensure_namespace_exists(&state, &namespace).await?;
 
     let id = Uuid::new_v4().to_string();
+    // Store an HMAC secret if supplied; fall back to a random unused string
+    // when only an Ed25519 pub key was uploaded so the column stays NOT NULL.
+    let jwt_secret_plaintext = req
+        .jwt_secret
+        .clone()
+        .unwrap_or_else(|| format!("ed25519-only:{}", Uuid::new_v4()));
     let envelope =
-        crypto::seal_envelope(&req.jwt_secret, &state.kek).map_err(AppError::Internal)?;
+        crypto::seal_envelope(&jwt_secret_plaintext, &state.kek).map_err(AppError::Internal)?;
 
     sqlx::query(
-        "INSERT INTO agents (id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace) VALUES (?, ?, ?, ?, 1, ?, ?)",
+        "INSERT INTO agents (id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, agent_pub) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&req.agent_id)
@@ -331,6 +366,7 @@ async fn create_agent(
     .bind(&envelope.wrapped_dek)
     .bind(&req.description)
     .bind(&namespace)
+    .bind(&req.agent_pub)
     .execute(&state.pool)
     .await
     .map_err(|e| {
@@ -752,4 +788,312 @@ async fn rotate_key(
         "new_kek_version": new_kek_version,
         "message": "KEK rotated. Restart the server with the NEW operator password to reload the KEK into memory."
     })))
+}
+
+// ─── Notification channels ─────────────────────────────────────────────────
+
+const NOTIFICATION_SELECT: &str = "SELECT id, channel_type, name, config_ciphertext, \
+    config_wrapped_dek, kek_version, enabled, description, created_at, updated_at \
+    FROM notification_channels";
+
+async fn list_notification_channels(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<NotificationChannelListItem>>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let rows = sqlx::query_as::<_, NotificationChannel>(
+        &format!("{} ORDER BY created_at", NOTIFICATION_SELECT),
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let items = rows
+        .into_iter()
+        .map(|c| NotificationChannelListItem {
+            id: c.id,
+            channel_type: c.channel_type,
+            name: c.name,
+            enabled: c.enabled != 0,
+            description: c.description,
+            created_at: c.created_at,
+            updated_at: c.updated_at,
+        })
+        .collect();
+
+    Ok(Json(items))
+}
+
+async fn create_notification_channel(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<CreateNotificationChannelRequest>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    if !is_valid_channel_type(&req.channel_type) {
+        return Err(AppError::BadRequest(format!(
+            "Invalid channel_type '{}'. Must be email, slack, telegram, or discord",
+            req.channel_type
+        )));
+    }
+    if req.name.trim().is_empty() {
+        return Err(AppError::BadRequest("name cannot be empty".into()));
+    }
+
+    let config_str = serde_json::to_string(&req.config)
+        .map_err(|e| AppError::BadRequest(format!("config must be JSON: {}", e)))?;
+
+    let envelope = crypto::seal_envelope(&config_str, &state.kek).map_err(AppError::Internal)?;
+    let id = Uuid::new_v4().to_string();
+
+    sqlx::query(
+        "INSERT INTO notification_channels \
+            (id, channel_type, name, config_ciphertext, config_wrapped_dek, kek_version, enabled, description) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&req.channel_type)
+    .bind(&req.name)
+    .bind(&envelope.body_ciphertext)
+    .bind(&envelope.wrapped_dek)
+    .bind(if req.enabled { 1_i64 } else { 0_i64 })
+    .bind(&req.description)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE constraint") {
+            AppError::Conflict(format!("Channel '{}' already exists", req.name))
+        } else {
+            AppError::Database(e)
+        }
+    })?;
+
+    audit::write(&state, None, None, "create_notification_channel", Some(&req.name), "success").await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "id": id, "name": req.name, "channel_type": req.channel_type })),
+    ))
+}
+
+async fn update_notification_channel(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateNotificationChannelRequest>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let existing = sqlx::query_as::<_, NotificationChannel>(
+        &format!("{} WHERE id = ?", NOTIFICATION_SELECT),
+    )
+    .bind(&id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("Channel '{}' not found", id)))?;
+
+    let (new_body, new_wrapped) = if let Some(cfg) = &req.config {
+        let s = serde_json::to_string(cfg)
+            .map_err(|e| AppError::BadRequest(format!("config must be JSON: {}", e)))?;
+        let env = crypto::seal_envelope(&s, &state.kek).map_err(AppError::Internal)?;
+        (env.body_ciphertext, env.wrapped_dek)
+    } else {
+        (existing.config_ciphertext.clone(), existing.config_wrapped_dek.clone())
+    };
+
+    let new_enabled: i64 = match req.enabled {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => existing.enabled,
+    };
+    let new_description = req.description.or(existing.description);
+
+    sqlx::query(
+        "UPDATE notification_channels SET config_ciphertext = ?, config_wrapped_dek = ?, \
+         enabled = ?, description = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(&new_body)
+    .bind(&new_wrapped)
+    .bind(new_enabled)
+    .bind(&new_description)
+    .bind(&id)
+    .execute(&state.pool)
+    .await?;
+
+    audit::write(&state, None, None, "update_notification_channel", Some(&existing.name), "success").await;
+    Ok(Json(json!({ "updated": true, "id": id })))
+}
+
+async fn delete_notification_channel(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM notification_channels WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let name = row
+        .map(|r| r.0)
+        .ok_or_else(|| AppError::NotFound(format!("Channel '{}' not found", id)))?;
+
+    sqlx::query("DELETE FROM notification_channels WHERE id = ?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await?;
+
+    audit::write(&state, None, None, "delete_notification_channel", Some(&name), "success").await;
+    Ok(Json(json!({ "deleted": true })))
+}
+
+async fn test_notification_channel(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM notification_channels WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let name = row
+        .map(|r| r.0)
+        .ok_or_else(|| AppError::NotFound(format!("Channel '{}' not found", id)))?;
+
+    notifications::dispatch(
+        &state,
+        notifications::NotificationEvent::RecoveryBoot {
+            hostname: Some(format!("test-from-channel:{}", name)),
+        },
+    );
+
+    Ok(Json(json!({ "queued": true, "name": name })))
+}
+
+// ─── Shamir share generation (#15) ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ShamirGenerateRequest {
+    threshold: u8,
+    shares: u8,
+}
+
+async fn generate_shamir_shares(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<ShamirGenerateRequest>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    if req.threshold < 2 || req.threshold > req.shares || req.shares > 200 {
+        return Err(AppError::BadRequest(
+            "threshold must be >=2, threshold <= shares, shares <= 200".into(),
+        ));
+    }
+
+    let shares = crate::shamir::split(state.kek.as_bytes(), req.threshold, req.shares)
+        .map_err(AppError::Internal)?;
+
+    audit::write(&state, None, None, "shamir_generate", None, "success").await;
+
+    Ok(Json(json!({
+        "threshold": req.threshold,
+        "shares_count": req.shares,
+        "shares": shares,
+        "warning": "Distribute these shares to operators NOW and DO NOT store them. \
+                    The server does not retain a copy. To recover, set CORTEX_RECOVERY_MODE=1 \
+                    and supply any threshold-many shares on stdin at boot."
+    })))
+}
+
+// ─── Device authorization (#16) — admin-side endpoints ────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WebDeviceApproveRequest {
+    user_code: String,
+    /// agent_id to bind this device to. The pending device must be approved
+    /// before the daemon's polling /device/token call returns 200.
+    agent_id: String,
+}
+
+async fn web_device_approve(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(req): Json<WebDeviceApproveRequest>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let user_code = req.user_code.trim().to_uppercase();
+    let agent_id = req.agent_id.trim().to_string();
+
+    let updated = sqlx::query(
+        "UPDATE pending_devices SET status = 'approved', agent_id = ?, approved_at = datetime('now') \
+         WHERE user_code = ? AND status = 'pending'",
+    )
+    .bind(&agent_id)
+    .bind(&user_code)
+    .execute(&state.pool)
+    .await?;
+
+    if updated.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!(
+            "No pending device with user_code '{}'",
+            user_code
+        )));
+    }
+
+    audit::write(&state, Some(&agent_id), None, "device_approve", Some(&user_code), "success").await;
+    Ok(Json(json!({ "approved": true, "user_code": user_code, "agent_id": agent_id })))
+}
+
+async fn list_devices(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<Value>>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let rows: Vec<(String, String, String, Option<String>, String, Option<String>)> =
+        sqlx::query_as(
+            "SELECT id, user_code, status, agent_id, created_at, approved_at \
+             FROM pending_devices ORDER BY created_at DESC LIMIT 200",
+        )
+        .fetch_all(&state.pool)
+        .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|(id, uc, st, ag, ct, ap)| {
+                json!({
+                    "id": id,
+                    "user_code": uc,
+                    "status": st,
+                    "agent_id": ag,
+                    "created_at": ct,
+                    "approved_at": ap,
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn delete_device(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    check_admin_token(&headers, &state.config.admin_token)?;
+
+    let result = sqlx::query("DELETE FROM pending_devices WHERE agent_id = ?")
+        .bind(&agent_id)
+        .execute(&state.pool)
+        .await?;
+
+    audit::write(&state, Some(&agent_id), None, "device_delete", None, "success").await;
+    Ok(Json(json!({ "deleted": true, "rows": result.rows_affected() })))
 }

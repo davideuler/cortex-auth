@@ -138,98 +138,148 @@ populated from `X-Cortex-Caller-*` request headers.
 
 ## 12. Honey Tokens (April 2026)
 
-**Resolved (basic)**. Secrets carry an `is_honey_token` boolean. A read attempt against a
+**Resolved**. Secrets carry an `is_honey_token` boolean. A read attempt against a
 honey-token immediately:
 
 1. Revokes the calling project's token (sets `token_revoked_at`).
 2. Writes an `alarm`-status row to the audit log (`action="honey_token_access"`).
 3. Returns a generic 401 to the caller.
+4. Dispatches an outbound notification to every enabled channel.
 
-**Open**: Outbound notifications. The current implementation logs via `tracing::warn!` and
-the audit log; it does not page on-call. Stakeholder decision needed on whether to wire a
-webhook / PagerDuty / e-mail integration.
+**Outbound notifications (resolved April 2026)**: `notification_channels` table holds
+envelope-encrypted channel configs managed via the dashboard's `Notifications` tab and
+`POST /admin/notification-channels`. Channel types:
 
-Outbound notifications: 
-Also support email by himalaya if himalaya-cli available, Email desitination can be configured in the admin dashboard.
-Also could send notification to Slack, Telegram and Discord channels which is configurable in the admin dashboard.
----
+- `slack`   — incoming webhook
+- `discord` — incoming webhook
+- `telegram`— Bot API (`bot_token` + `chat_id`)
+- `email`   — pipes the message to `himalaya-cli` on stdin (when on PATH)
 
+Dispatch is fire-and-forget per channel in a tokio task; a slow webhook never blocks
+the calling request handler. See `cortex-server/src/notifications.rs`.
 
-## 13. Ed25519 Agent Identity (deferred)
-
-**Design intent (UPDATED_DESIGN.md §9)**: Replace the current HS256 JWT auth (where the
-agent's `jwt_secret` lives encrypted in the DB and the agent must prove possession of it)
-with Ed25519 keypairs. The agent generates `(priv_a, pub_a)` locally and only uploads
-`pub_a`; auth proofs are Ed25519 signatures over `ts || nonce || agent_id || path`.
-
-**Status**: NOT IMPLEMENTED. The current code still uses HMAC-SHA256 JWTs with shared
-`jwt_secret`s encrypted in the DB (`agents.jwt_secret_encrypted`). Migrating requires:
-- Adding `agent_pub` column to `agents` table.
-- Switching `/agent/discover` validation from `jsonwebtoken::decode` to
-  `ed25519_dalek::Verifier`.
-- Updating `cortex-cli gen-token` to sign with a local private key instead of HS256.
-- Coordinating a forward migration: existing agents need to upload a public key on first
-  re-auth before their JWT secret is purged.
+**Still open**: severity filters / per-channel templating / retry-with-backoff. Today
+every channel receives the same plain-text payload for both honey-token alarms and
+recovery-boot events. Tracked under #20.
 
 ---
 
-## 14. Signed Ed25519 Project Tokens (deferred)
 
-**Design intent (UPDATED_DESIGN.md §7)**: Project tokens become Ed25519-signed JWTs of
-the form `base64(claims) || base64(sig)` with claims `{iss, sub, aud, iat, exp, jti, scope,
-namespace, project_id}`. A request body must include `ts + nonce + path + method` so an
-intercepted token cannot be replayed against a different endpoint.
+## 13. Ed25519 Agent Identity (April 2026)
 
-**Status**: NOT IMPLEMENTED. The token is still an opaque random string SHA-256 hashed
-into `projects.project_token_hash`, but the `scope` claim is now stored alongside the
-hash (#10). Migrating requires:
-- Server keypair (`server_priv`, `server_pub`) generated/loaded at boot, sealed with the
-  KEK at rest, mlocked in memory.
-- A JWKS endpoint (`GET /.well-known/jwks.json`) for the server public key, with `kid`
-  versioning so old tokens stay verifiable across rotations.
-- Token issuance produces an EdDSA-signed JWT instead of a random hex string.
-- Verification path replaces hash lookup with signature verification + revocation check
-  against a `revoked_token_jti` table.
+**Resolved (basic)**. The migration `007_ed25519_and_devices.sql` adds an `agent_pub`
+column to `agents`. Registration (`POST /admin/agents`) accepts either:
 
----
+- `jwt_secret` (legacy HMAC-SHA256 path — preserved for backwards compatibility), and/or
+- `agent_pub` (base64url-encoded Ed25519 public key — preferred).
 
-## 15. Shamir m-of-n Unseal Recovery (deferred)
+When an agent has `agent_pub`, `/agent/discover` requires the request body to include
+`ts` and `nonce` and verifies `auth_proof` as an Ed25519 signature over
+`ts | nonce | agent_id | /agent/discover`. The ts must be within ±5 minutes of the
+server clock (drop-replay window).
 
-**Design intent (UPDATED_DESIGN.md §8)**: To survive operator password loss, the KEK can
-be reconstructed from a Shamir secret-sharing `(m, n)` set (e.g. 3-of-5). Each share is
-distributed to a different operator at install time; on a recovery boot the server reads
-m shares from stdin, reconstructs the KEK, and verifies the sentinel.
+CLI:
+- `cortex-cli gen-key --agent-id <id>` writes a private key to
+  `~/.cortex/agent-<id>.key` (mode 0600) and prints the base64url public key on stdout.
+- `cortex-cli sign-proof --agent-id <id> --priv-key-file <path>` prints a JSON
+  `{ts, nonce, auth_proof}` ready to splice into the discover body.
 
-**Status**: NOT IMPLEMENTED. Depend on a Shamir crate
-(`sharks`, `vsss-rs`) implementation. Also: the recovery UX (interactive
-prompt vs. multi-file) and audit/alarm story when the server boots in recovery mode.
-
-By interactive prompt to recover. 
-Log and send outbound notifications when server boots in recovery mode.
+**Still open**:
+- Forward migration: a campaign that asks every existing HMAC agent to upload a public
+  key, then purges the encrypted HMAC secret. Today both credentials can coexist on the
+  same row.
+- Replay nonce caching (an LRU of `(agent_id, nonce)` for the 5-minute window) — the
+  current path only enforces the timestamp bound. Tracked in NEXT_STEPS #4.
 
 ---
 
-## 16. cortex-cli Daemon + Device Authorization (deferred)
+## 14. Signed Ed25519 Project Tokens (April 2026)
 
-**Design intent (UPDATED_DESIGN.md §9)**: A long-running `cortex-daemon` process
-authenticates once via the OAuth 2.0 Device Authorization Grant (RFC 8628), holds the
-agent's Ed25519 private key in mlocked memory, and exposes a Unix socket
-(`~/.cortex/agent.sock`) where `cortex-cli run` can ask it to "exec a command with these
-secrets injected" — without ever returning the secret to the caller.
+**Resolved (basic)**. The migration adds `server_keys` (envelope-encrypted server signing
+key) and `revoked_token_jti`. On first boot the server generates an Ed25519 keypair,
+stores it sealed under the KEK, and exposes the public key at
+`GET /.well-known/jwks.json` (kid-versioned).
 
-This protects against the AI-agent-on-the-same-UID problem: an agent process on the same
-machine can connect to the socket and ask the daemon to run a known-good binary, but it
-cannot extract raw secret material because the socket exposes only `run()` /
-`inject_template()` / `ssh_proxy()`, never `get_secret()`.
+`POST /agent/discover` accepts `signed_token: true`. When set, the response carries an
+EdDSA-signed JWT in `signed_project_token` alongside the legacy random `project_token`.
+Claims: `{iss, sub, aud, iat, exp, jti, scope, namespace, project_id}`. Both formats are
+accepted on `/project/*` — the verification path branches on whether the bearer token has
+3 dot-separated segments (JWT) or not (legacy hex hash compare).
 
-**Status**: NOT IMPLEMENTED. A large body of work:
-- `cortex-cli daemon login` / `logout` / `status` subcommands.
-- Server endpoints: `POST /device/authorize`, `POST /device/token`, `GET /device`,
-  `POST /web/device/approve`, `GET /devices`, `DELETE /devices/{agent_id}`.
-- New `pending_devices` table and SSO integration at `/auth/oidc/*`.
-- Web UI for the user-facing approval flow.
-- Frequency limits (1 authorize/min/IP, 5 devices/user/day, etc.).
-- Dashboard tab listing all enrolled devices for the current user.
+Revocation is via `revoked_token_jti` (checked on every signed-token request). The
+`/admin/projects/<name>/revoke` endpoint also continues to set `token_revoked_at` for the
+legacy path.
+
+**Still open**:
+- Insert a `revoked_token_jti` row when an admin revokes a project — today only legacy
+  tokens are revoked; signed JWTs are revoked only by setting `exp` past or by waiting
+  for natural expiry. The migration column exists; wiring the admin handler is small but
+  not yet done.
+- Body-replay protection (`ts + nonce + path + method` covered by an HMAC over the
+  bearer) — the design calls for this on every request; today only the discover path
+  uses ts/nonce.
+
+---
+
+## 15. Shamir m-of-n Unseal Recovery (April 2026)
+
+**Resolved**. The `sharks` crate provides a `(m, n)` Shamir split/recover primitive.
+
+- `POST /admin/shamir/generate {threshold, shares}` splits the *running* KEK into n
+  shares with threshold m and returns them once. The server retains nothing; the
+  response carries a `warning` field telling the operator to distribute immediately.
+- `CORTEX_RECOVERY_MODE=1 CORTEX_RECOVERY_THRESHOLD=<m>` boots in recovery mode. The
+  server prompts for m shares interactively on stdin (echo disabled via `rpassword`),
+  reconstructs the KEK, verifies the on-disk sentinel, and either succeeds or refuses to
+  bind the listener.
+- A successful recovery boot writes an `alarm`-status `recovery_boot` row to the audit
+  log and dispatches notifications to every enabled channel (#12).
+
+See `cortex-server/src/shamir.rs` and `cortex-server/src/kek.rs::unseal_via_recovery`.
+
+**Still open**:
+- Multi-file share input (today: stdin only) — operators sometimes prefer dropping share
+  files into a directory. Easy to add as a fallback.
+- Restoring the KEK *and* the operator password — the current recovery boot only puts
+  the KEK back in memory; rotating to a fresh password requires running
+  `POST /admin/rotate-key` from the recovered instance.
+
+---
+
+## 16. cortex-cli Daemon + Device Authorization (April 2026)
+
+**Resolved (basic)**. Server-side endpoints + scaffolding daemon + dashboard UI:
+
+Server endpoints (in `cortex-server/src/api/agent.rs` + `admin.rs`):
+- `POST /device/authorize`            — issues `device_code` + `user_code` (10 min TTL).
+- `POST /device/token`                — daemon polls; returns `authorization_pending`
+  until approved, then mints an EdDSA JWT access token bound to the agent_id.
+- `GET  /device`                      — minimal HTML approval form.
+- `POST /admin/web/device/approve`    — admin-token-gated approval (binds user_code → agent_id).
+- `GET  /admin/devices`               — list pending + enrolled devices.
+- `DELETE /admin/devices/:agent_id`   — revoke a device.
+
+CLI (`cortex-cli daemon login | status | logout`) implements the OAuth 2.0 device-grant
+client flow, persisting the access token at `~/.cortex/daemon-session.json` (mode 0600).
+
+`cortex-daemon` (separate binary in the cortex-cli crate) listens on
+`~/.cortex/agent.sock` (mode 0600) with a single-line JSON protocol:
+
+- `{"cmd":"status"}` → returns the cached daemon-session JSON.
+- `{"cmd":"run","program":..,"args":..,"project":..,"token":..,"url":..}` → fetches
+  secrets, spawns the program with the env vars injected, returns
+  `{"ok":true,"exit_code":N}` after the child exits. The raw secret values never travel
+  back over the socket.
+
+**Still open**:
+- SSO integration at `/auth/oidc/*` — today device approval is admin-token-gated, not
+  user-bound.
+- Frequency limits (1 authorize/min/IP, 5 devices/user/day) — rate limiting is generally
+  absent; tracked under NEXT_STEPS #3.
+- `inject_template` and `ssh_proxy` socket commands.
+- Daemon attestation (#17 below).
+- OS-level hardening: `prctl(PR_SET_DUMPABLE, 0)`, `mlockall`, sysctl
+  `kernel.yama.ptrace_scope=2`, `MemoryDenyWriteExecute=yes`, `PT_DENY_ATTACH` on macOS.
 
 ---
 
@@ -278,12 +328,18 @@ rotate without breaking in-flight tokens. The standard answer is JWKS at
 
 ---
 
-## 20. Honey-Token Outbound Alerting (deferred)
+## 20. Honey-Token Outbound Alerting (April 2026)
 
-The honey-token alarm is currently logged to the audit table and `tracing::warn!`. Real
-deployments need an outbound webhook (PagerDuty, Slack, generic webhook) to ensure an
-on-call human sees the alarm in seconds. Stakeholder decision needed on the integration
-target and whether the webhook URL is per-namespace.
+**Resolved (basic)** — see #12. Slack / Discord / Telegram / email-via-himalaya channels
+are now implemented and dispatched on every honey-token access (and on Shamir recovery
+boots — #15).
+
+**Still open**:
+- Per-namespace channel mapping (today every channel receives every event).
+- Severity filters so a slack channel can opt into honey-token alarms but not
+  recovery-boot pages.
+- Per-channel payload templating (today every channel gets the same plain-text body).
+- Retry / exponential backoff (today a single attempt; failures land in `tracing::warn!`).
 
 ---
 
