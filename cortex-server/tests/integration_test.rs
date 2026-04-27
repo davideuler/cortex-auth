@@ -6,7 +6,9 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use cortex_server::{build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState};
+use cortex_server::{
+    admin_token, build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState,
+};
 
 async fn setup_test_app() -> axum::Router {
     let config = AppConfig::test_config();
@@ -14,7 +16,10 @@ async fn setup_test_app() -> axum::Router {
     db::run_migrations(&pool).await.unwrap();
     let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
     let server_keypair = ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
-    let state = AppState::new(pool, config, unsealed.kek, server_keypair);
+    let admin_hash = admin_token::set_admin_token_for_tests(&pool, "test-admin-token")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, config, unsealed.kek, server_keypair, admin_hash);
     build_router(state)
 }
 
@@ -1030,7 +1035,9 @@ async fn test_admin_projects_list_includes_token_status() {
 
 #[tokio::test]
 async fn test_expired_token_returns_token_expired_error_code() {
-    use cortex_server::{build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState};
+    use cortex_server::{
+        admin_token, build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState,
+    };
 
     // Build app on a pool we keep a handle to, so we can backdate the token
     // expiry directly in SQL to simulate the 120-minute boundary elapsing.
@@ -1039,7 +1046,10 @@ async fn test_expired_token_returns_token_expired_error_code() {
     db::run_migrations(&pool).await.unwrap();
     let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
     let kp = ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
-    let state = AppState::new(pool.clone(), config, unsealed.kek, kp);
+    let admin_hash = admin_token::set_admin_token_for_tests(&pool, "test-admin-token")
+        .await
+        .unwrap();
+    let state = AppState::new(pool.clone(), config, unsealed.kek, kp, admin_hash);
     let app = build_router(state);
 
     // Seed an agent + secret + project via the admin/discover endpoints.
@@ -1175,7 +1185,17 @@ async fn test_envelope_each_secret_has_unique_wrapped_dek() {
         .await
         .unwrap();
     let kp = cortex_server::ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
-    let app = build_router(AppState::new(pool.clone(), config, unsealed.kek, kp));
+    let admin_hash =
+        cortex_server::admin_token::set_admin_token_for_tests(&pool, "test-admin-token")
+            .await
+            .unwrap();
+    let app = build_router(AppState::new(
+        pool.clone(),
+        config,
+        unsealed.kek,
+        kp,
+        admin_hash,
+    ));
 
     for (path, val) in [("a_key", "value-a"), ("b_key", "value-b")] {
         let req = Request::builder()

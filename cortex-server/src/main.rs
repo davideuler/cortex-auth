@@ -4,7 +4,7 @@ use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use cortex_server::{
-    build_router,
+    admin_token, build_router,
     config::{
         read_kek_password, read_shamir_shares, recovery_mode_requested, recovery_threshold,
         AppConfig,
@@ -56,6 +56,27 @@ async fn main() -> anyhow::Result<()> {
 
     let server_keypair = ed25519_keys::load_or_init(&pool, &unsealed.kek).await?;
 
+    let admin = admin_token::ensure_admin_token(&pool).await?;
+    if let Some(plaintext) = admin.plaintext_to_show.as_deref() {
+        let banner = "=".repeat(72);
+        println!();
+        println!("{}", banner);
+        println!("  CORTEX-AUTH ADMIN TOKEN (shown ONCE — copy it now)");
+        println!("  Send it to the server in the X-Admin-Token header.");
+        println!();
+        println!("    {}", plaintext);
+        println!();
+        println!("  Only a one-way SHA-256 hash is stored on the server. If you");
+        println!("  lose this value you must regenerate it (drop the admin_token");
+        println!("  row and restart) — there is no way to recover it.");
+        println!("{}", banner);
+        println!();
+    } else {
+        tracing::info!(
+            "Admin token already initialized — using stored hash for X-Admin-Token verification"
+        );
+    }
+
     // Daily cleanup: remove audit logs older than 60 days
     let cleanup_pool = pool.clone();
     tokio::spawn(async move {
@@ -75,7 +96,13 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let recovery_mode = unsealed.recovery_mode;
-    let state = AppState::new(pool, config.clone(), unsealed.kek, server_keypair);
+    let state = AppState::new(
+        pool,
+        config.clone(),
+        unsealed.kek,
+        server_keypair,
+        admin.hash,
+    );
 
     if recovery_mode {
         cortex_server::audit::write(&state, None, None, "recovery_boot", None, "alarm").await;

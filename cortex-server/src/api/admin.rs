@@ -64,12 +64,12 @@ pub fn router() -> Router<AppState> {
         .route("/web/device/approve", post(web_device_approve))
 }
 
-fn check_admin_token(headers: &HeaderMap, expected: &str) -> Result<(), AppError> {
+fn check_admin_token(headers: &HeaderMap, expected_hash: &str) -> Result<(), AppError> {
     let token = headers
         .get("x-admin-token")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::Unauthorized("Missing X-Admin-Token header".into()))?;
-    if token != expected {
+    if !crypto::verify_token(token, expected_hash) {
         return Err(AppError::Unauthorized("Invalid admin token".into()));
     }
     Ok(())
@@ -92,7 +92,7 @@ async fn list_secrets(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<SecretListItem>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::secret::Secret>(
         &format!("{} ORDER BY key_path", SECRET_SELECT),
@@ -121,7 +121,7 @@ async fn create_secret(
     State(state): State<AppState>,
     Json(req): Json<CreateSecretRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     if !crate::models::secret::Secret::is_valid_type(&req.secret_type) {
         return Err(AppError::BadRequest(format!(
@@ -181,7 +181,7 @@ async fn get_secret(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SecretDetail>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
         &format!("{} WHERE id = ?", SECRET_SELECT),
@@ -217,7 +217,7 @@ async fn update_secret(
     Path(id): Path<String>,
     Json(req): Json<UpdateSecretRequest>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let existing = sqlx::query_as::<_, crate::models::secret::Secret>(
         &format!("{} WHERE id = ?", SECRET_SELECT),
@@ -276,7 +276,7 @@ async fn delete_secret(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
         &format!("{} WHERE id = ?", SECRET_SELECT),
@@ -308,7 +308,7 @@ async fn list_agents(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentListItem>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::agent::Agent>(
         &format!("{} ORDER BY created_at", AGENT_SELECT),
@@ -336,7 +336,7 @@ async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     if req.jwt_secret.is_none() && req.agent_pub.is_none() {
         return Err(AppError::BadRequest(
@@ -398,7 +398,7 @@ async fn delete_agent(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let result = sqlx::query("DELETE FROM agents WHERE agent_id = ?")
         .bind(&agent_id)
@@ -421,7 +421,7 @@ async fn list_policies(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PolicyDetail>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::policy::Policy>(
         "SELECT id, policy_name, agent_pattern, allowed_paths, denied_paths, created_at FROM policies ORDER BY created_at",
@@ -437,7 +437,7 @@ async fn create_policy(
     State(state): State<AppState>,
     Json(req): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let id = Uuid::new_v4().to_string();
     let allowed = serde_json::to_string(&req.allowed_paths).unwrap();
@@ -482,7 +482,7 @@ async fn delete_policy(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let result = sqlx::query("DELETE FROM policies WHERE id = ?")
         .bind(&id)
@@ -502,7 +502,7 @@ async fn list_projects(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ProjectListItem>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::project::Project>(
         "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects ORDER BY created_at",
@@ -533,7 +533,7 @@ async fn revoke_project_token(
     State(state): State<AppState>,
     Path(project_name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let result = sqlx::query(
         "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
@@ -581,7 +581,7 @@ async fn list_namespaces(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Namespace>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, Namespace>(
         "SELECT name, description, created_at FROM namespaces ORDER BY name",
@@ -597,7 +597,7 @@ async fn create_namespace(
     State(state): State<AppState>,
     Json(req): Json<CreateNamespaceRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let name = req.name.trim();
     if name.is_empty() {
@@ -630,7 +630,7 @@ async fn delete_namespace(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     if name == "default" {
         return Err(AppError::BadRequest(
@@ -675,7 +675,7 @@ async fn list_audit_logs(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AuditLog>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let logs = sqlx::query_as::<_, AuditLog>(
         "SELECT id, agent_id, project_name, action, resource_path, status, timestamp, \
@@ -702,7 +702,7 @@ async fn rotate_key(
     State(state): State<AppState>,
     Json(req): Json<RotateKekRequest>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let new_password = req.new_kek_password.trim();
     if new_password.is_empty() {
@@ -800,7 +800,7 @@ async fn list_notification_channels(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<NotificationChannelListItem>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, NotificationChannel>(
         &format!("{} ORDER BY created_at", NOTIFICATION_SELECT),
@@ -829,7 +829,7 @@ async fn create_notification_channel(
     State(state): State<AppState>,
     Json(req): Json<CreateNotificationChannelRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     if !is_valid_channel_type(&req.channel_type) {
         return Err(AppError::BadRequest(format!(
@@ -883,7 +883,7 @@ async fn update_notification_channel(
     Path(id): Path<String>,
     Json(req): Json<UpdateNotificationChannelRequest>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let existing = sqlx::query_as::<_, NotificationChannel>(
         &format!("{} WHERE id = ?", NOTIFICATION_SELECT),
@@ -930,7 +930,7 @@ async fn delete_notification_channel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let row: Option<(String,)> =
         sqlx::query_as("SELECT name FROM notification_channels WHERE id = ?")
@@ -955,7 +955,7 @@ async fn test_notification_channel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let row: Option<(String,)> =
         sqlx::query_as("SELECT name FROM notification_channels WHERE id = ?")
@@ -989,7 +989,7 @@ async fn generate_shamir_shares(
     State(state): State<AppState>,
     Json(req): Json<ShamirGenerateRequest>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     if req.threshold < 2 || req.threshold > req.shares || req.shares > 200 {
         return Err(AppError::BadRequest(
@@ -1027,7 +1027,7 @@ async fn web_device_approve(
     State(state): State<AppState>,
     Json(req): Json<WebDeviceApproveRequest>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let user_code = req.user_code.trim().to_uppercase();
     let agent_id = req.agent_id.trim().to_string();
@@ -1056,7 +1056,7 @@ async fn list_devices(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Value>>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows: Vec<(String, String, String, Option<String>, String, Option<String>)> =
         sqlx::query_as(
@@ -1087,7 +1087,7 @@ async fn delete_device(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    check_admin_token(&headers, &state.config.admin_token)?;
+    check_admin_token(&headers, &state.admin_token_hash)?;
 
     let result = sqlx::query("DELETE FROM pending_devices WHERE agent_id = ?")
         .bind(&agent_id)

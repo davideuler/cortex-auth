@@ -1,3 +1,4 @@
+pub mod admin_token;
 pub mod api;
 pub mod audit;
 pub mod config;
