@@ -4,7 +4,9 @@
 -- its own random Data Encryption Key (DEK) wrapped by the in-memory KEK; this
 -- column carries the wrapped DEK as `nonce_k || ciphertext_of_DEK`, base64.
 -- The body ciphertext (nonce_d || ciphertext_of_value, base64) stays in the
--- existing `encrypted_value` / `jwt_secret_encrypted` column.
+-- existing `encrypted_value` / `jwt_secret_encrypted` column. The
+-- `jwt_secret_encrypted` column was later removed in migration 008 when the
+-- legacy HMAC agent auth path was retired.
 
 CREATE TABLE IF NOT EXISTS kek_metadata (
     id INTEGER PRIMARY KEY CHECK (id = 1),

@@ -5,7 +5,6 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -14,7 +13,7 @@ use crate::{
     crypto,
     error::AppError,
     models::{
-        agent::{Agent, AgentClaims},
+        agent::Agent,
         policy::Policy,
         project::{
             parse_env_file, DiscoverRequest, DiscoverResponse, SecretsResponse,
@@ -38,7 +37,7 @@ pub fn project_router() -> Router<AppState> {
 const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
 const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT_FULL: &str =
-    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at, agent_pub FROM agents";
+    "SELECT id, agent_id, description, namespace, created_at, agent_pub FROM agents";
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     headers
@@ -150,52 +149,25 @@ async fn discover(
     .await?
     .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
 
-    if let Some(pub_b64) = &agent.agent_pub {
-        // (#13) Ed25519 path. Message is `ts|nonce|agent_id|/agent/discover`
-        // — each field separated by '|'. Replay protection is by the 5-minute
-        // ts window; nonce caching is a future hardening (see UNCERTAINTIES).
-        let ts = req.ts.ok_or_else(|| {
-            AppError::Unauthorized("ts required for Ed25519 auth_proof".into())
-        })?;
-        let nonce = req
-            .nonce
-            .as_deref()
-            .ok_or_else(|| AppError::Unauthorized("nonce required for Ed25519 auth_proof".into()))?;
-        let now = Utc::now().timestamp();
-        if (now - ts).abs() > 300 {
-            return Err(AppError::Unauthorized(
-                "auth_proof ts is more than 5 minutes from server clock".into(),
-            ));
-        }
-        let message = format!("{}|{}|{}|/agent/discover", ts, nonce, req.agent_id);
-        crate::ed25519_keys::verify_agent_signature(pub_b64, message.as_bytes(), &req.auth_proof)
-            .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
-    } else {
-        // Legacy HMAC-SHA256 JWT path.
-        let wrapped = agent
-            .wrapped_dek
-            .as_deref()
-            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
-        let jwt_secret = crypto::open_envelope(&agent.jwt_secret_encrypted, wrapped, &state.kek)
-            .map_err(AppError::Internal)?;
-
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = false;
-        validation.required_spec_claims.clear();
-
-        let token_data = decode::<AgentClaims>(
-            &req.auth_proof,
-            &DecodingKey::from_secret(jwt_secret.as_bytes()),
-            &validation,
-        )
-        .map_err(|_| AppError::Unauthorized("Invalid auth_proof JWT".into()))?;
-
-        if token_data.claims.sub != req.agent_id {
-            return Err(AppError::Unauthorized(
-                "JWT subject does not match agent_id".into(),
-            ));
-        }
+    // (#13) Ed25519 auth_proof: signature over `ts|nonce|agent_id|/agent/discover`.
+    // Replay protection is by the 5-minute ts window; nonce caching is a
+    // future hardening (see UNCERTAINTIES).
+    let ts = req
+        .ts
+        .ok_or_else(|| AppError::Unauthorized("ts required for auth_proof".into()))?;
+    let nonce = req
+        .nonce
+        .as_deref()
+        .ok_or_else(|| AppError::Unauthorized("nonce required for auth_proof".into()))?;
+    let now = Utc::now().timestamp();
+    if (now - ts).abs() > 300 {
+        return Err(AppError::Unauthorized(
+            "auth_proof ts is more than 5 minutes from server clock".into(),
+        ));
     }
+    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, req.agent_id);
+    crate::ed25519_keys::verify_agent_signature(&agent.agent_pub, message.as_bytes(), &req.auth_proof)
+        .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
 
     let agent_id = agent.agent_id.clone();
     let namespace = agent.namespace.clone();

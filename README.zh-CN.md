@@ -21,10 +21,10 @@
   │               Agent               │                        │
   │         （自主运行的 AI 流水线）    │                        │
   │                                   ▼                        │
-  │  ① cortex-cli gen-token  ┌─────────────────┐              │
+  │  ① cortex-cli sign-proof ┌─────────────────┐              │
   │  ──────────────────────► │   cortex-cli    │              │
   │                          │                 │              │
-  │  ④ cortex-cli run        │  gen-token      │              │
+  │  ④ cortex-cli run        │  sign-proof     │              │
   │  ──────────────────────► │  run → exec()   │              │
   └──────────────────────────┴────────┬────────┘──────────────┘
                                       │
@@ -44,7 +44,7 @@
 
 **执行流程：**
 1. **管理员** 通过 admin API 将项目密钥预存至 `cortex-server`
-2. **Agent** 调用 `cortex-cli gen-token` 签名 JWT（`auth_proof`）以证明身份
+2. **Agent** 调用 `cortex-cli sign-proof` 用本地 Ed25519 私钥签名 `auth_proof` 以证明身份
 3. **Agent** 将 `auth_proof` POST 到 `/agent/discover` → 获取 `project_token`
 4. **Agent** 调用 `cortex-cli run --project <name> --token <project_token>`，从服务器拉取密钥并通过 `exec()` 将其注入为环境变量后启动目标进程
 
@@ -130,11 +130,14 @@ curl -X POST http://localhost:3000/admin/secrets \
   -H "X-Admin-Token: $ADMIN_TOKEN" \
   -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-your-key"}'
 
-# 发现项目密钥（使用 agent_id + 签名 JWT 进行认证）
-AUTH_PROOF=$(cortex-cli gen-token --agent-id my-agent --jwt-secret <agent_jwt_secret>)
+# 发现项目密钥（使用 agent_id + Ed25519 签名进行认证）
+# `cortex-cli sign-proof` 读取 `cortex-cli gen-key` 生成的私钥
+# (~/.cortex/agent-<id>.key)，输出 {"ts","nonce","auth_proof"} JSON。
+PROOF=$(cortex-cli sign-proof --agent-id my-agent \
+  --priv-key-file ~/.cortex/agent-my-agent.key)
 curl -X POST http://localhost:3000/agent/discover \
   -H "Content-Type: application/json" \
-  -d "{\"agent_id\":\"my-agent\",\"auth_proof\":\"$AUTH_PROOF\",\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
+  -d "{\"agent_id\":\"my-agent\",$(echo $PROOF | tr -d '{}'),\"context\":{\"project_name\":\"my-app\",\"file_content\":\"OPENAI_API_KEY=\"}}"
 # 保存返回的 project_token！
 
 # 注入密钥并启动应用
@@ -293,10 +296,11 @@ curl -X POST http://localhost:3000/admin/secrets \
 
 ### Ed25519 Agent 身份（#13）
 
-Agent 现在可以注册 **Ed25519 公钥** 替代（或并行于）传统的 HMAC `jwt_secret`。
-Agent 在本地用 `cortex-cli gen-key` 生成密钥对，仅上传公钥，并在 `/agent/discover`
-时对 `ts | nonce | agent_id | /agent/discover` 进行 Ed25519 签名作为 `auth_proof`。
-请求 `ts` 必须在服务器时钟 ±5 分钟内（防重放）。
+每个 Agent 都使用 **Ed25519 公钥**进行认证。Agent 在本地用 `cortex-cli gen-key`
+生成密钥对，仅上传公钥，并在 `/agent/discover` 时对
+`ts | nonce | agent_id | /agent/discover` 进行 Ed25519 签名作为 `auth_proof`。
+请求 `ts` 必须在服务器时钟 ±5 分钟内（防重放）。私钥永远不离开 Agent 主机，
+泄露 DB 也只暴露公钥。
 
 ```bash
 # 1. 本地生成密钥对（私钥落盘 ~/.cortex/agent-<id>.key，权限 0600）
@@ -354,7 +358,7 @@ cortex-cli daemon status
 - AES-256-GCM 全程使用唯一随机 nonce，DEK→密文 与 KEK→DEK 两层均独立 nonce
 - 项目令牌：legacy 路径用 SHA-256 哈希存储；signed_token 路径使用 EdDSA JWT，公钥经 JWKS 暴露
 - 管理员操作通过静态 `ADMIN_TOKEN` 保护（多用户 RBAC 列入 #18）
-- `/agent/discover` 支持 Ed25519（优先）或 HMAC-SHA256 JWT 验证 Agent 身份
+- `/agent/discover` 使用 Ed25519 验证 Agent 身份（无 HMAC fallback）
 - 全量审计日志且 HMAC-SHA256 链式防篡改
 - `cortex-cli` 使用 `exec()` 启动子进程——父进程无法访问密钥
 - `cortex-daemon` 通过 Unix socket 屏蔽密钥导出

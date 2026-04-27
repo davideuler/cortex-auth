@@ -2,7 +2,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
+use rand_core::OsRng;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -23,45 +26,80 @@ async fn body_json(body: Body) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-fn make_agent_jwt(agent_id: &str, jwt_secret: &str) -> String {
-    use jsonwebtoken::{encode, EncodingKey, Header};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize)]
-    struct Claims {
-        sub: String,
-        iat: u64,
-    }
-
-    let claims = Claims {
-        sub: agent_id.to_string(),
-        iat: chrono::Utc::now().timestamp() as u64,
-    };
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(jwt_secret.as_bytes()),
-    )
-    .unwrap()
+/// Per-agent Ed25519 keypair used by integration tests to register agents
+/// (`agent_pub`) and sign `/agent/discover` `auth_proof`s.
+struct AgentKeypair {
+    signing: SigningKey,
 }
 
-/// Creates app with two KEY_VALUE secrets and a default agent. Returns (app, auth_proof).
-async fn setup_app_with_secrets() -> (axum::Router, String) {
-    let app = setup_test_app().await;
+impl AgentKeypair {
+    fn new() -> Self {
+        Self { signing: SigningKey::generate(&mut OsRng) }
+    }
 
-    // Create agent in default namespace
+    fn pub_b64(&self) -> String {
+        B64URL.encode(self.signing.verifying_key().to_bytes())
+    }
+
+    /// Returns `(ts, nonce, auth_proof)` for the given agent_id. Each call
+    /// uses a fresh nonce so concurrent discover calls don't collide.
+    fn sign_for(&self, agent_id: &str) -> (i64, String, String) {
+        use rand_core::RngCore;
+        let ts = chrono::Utc::now().timestamp();
+        let mut nonce_bytes = [0u8; 8];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce: String = nonce_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        let message = format!("{}|{}|{}|/agent/discover", ts, nonce, agent_id);
+        let sig = self.signing.sign(message.as_bytes());
+        (ts, nonce, B64URL.encode(sig.to_bytes()))
+    }
+}
+
+/// Build a `/agent/discover` request body signed by the given keypair.
+fn discover_body(
+    keypair: &AgentKeypair,
+    agent_id: &str,
+    project_name: &str,
+    file_content: &str,
+    regenerate: bool,
+) -> Value {
+    let (ts, nonce, auth_proof) = keypair.sign_for(agent_id);
+    let mut body = json!({
+        "agent_id": agent_id,
+        "auth_proof": auth_proof,
+        "ts": ts,
+        "nonce": nonce,
+        "context": {
+            "project_name": project_name,
+            "file_content": file_content,
+        }
+    });
+    if regenerate {
+        body["regenerate_token"] = json!(true);
+    }
+    body
+}
+
+async fn register_agent(app: &axum::Router, agent_id: &str, agent_pub: &str) {
     let req = Request::builder()
         .method("POST")
         .uri("/admin/agents")
         .header("content-type", "application/json")
         .header("x-admin-token", "test-admin-token")
         .body(Body::from(
-            json!({"agent_id": "discover-agent", "jwt_secret": "discover-jwt-secret"})
-                .to_string(),
+            json!({"agent_id": agent_id, "agent_pub": agent_pub}).to_string(),
         ))
         .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "agent registration must succeed");
+}
+
+/// Creates app with two KEY_VALUE secrets and a default Ed25519-backed agent.
+/// Returns the router plus the agent's keypair so callers can sign auth_proofs.
+async fn setup_app_with_secrets() -> (axum::Router, AgentKeypair) {
+    let app = setup_test_app().await;
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "discover-agent", &keypair.pub_b64()).await;
 
     // Create two KEY_VALUE secrets in default namespace
     for (path, val) in [
@@ -80,8 +118,7 @@ async fn setup_app_with_secrets() -> (axum::Router, String) {
         app.clone().oneshot(req).await.unwrap();
     }
 
-    let auth_proof = make_agent_jwt("discover-agent", "discover-jwt-secret");
-    (app, auth_proof)
+    (app, keypair)
 }
 
 // ====================== SECRET CRUD TESTS ======================
@@ -217,6 +254,7 @@ async fn test_admin_token_required() {
 #[tokio::test]
 async fn test_create_list_delete_agent() {
     let app = setup_test_app().await;
+    let keypair = AgentKeypair::new();
 
     let req = Request::builder()
         .method("POST")
@@ -226,7 +264,7 @@ async fn test_create_list_delete_agent() {
         .body(Body::from(
             json!({
                 "agent_id": "agent-test-01",
-                "jwt_secret": "my-super-secret-jwt-key",
+                "agent_pub": keypair.pub_b64(),
                 "description": "Test agent"
             })
             .to_string(),
@@ -320,21 +358,20 @@ async fn test_create_list_delete_policy() {
 
 #[tokio::test]
 async fn test_discover_full_match() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {
-                    "project_name": "movie-translator",
-                    "file_content": "OPENAI_API_KEY=\nDASHSCOPE_API_KEY="
-                }
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "movie-translator",
+                "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -351,7 +388,7 @@ async fn test_discover_full_match() {
 
 #[tokio::test]
 async fn test_discover_requires_valid_auth() {
-    let (app, _) = setup_app_with_secrets().await;
+    let (app, _keypair) = setup_app_with_secrets().await;
 
     // Missing agent_id and auth_proof returns 422 (unprocessable entity)
     let req = Request::builder()
@@ -370,18 +407,20 @@ async fn test_discover_requires_valid_auth() {
             || resp.status() == StatusCode::BAD_REQUEST
     );
 
-    // Wrong jwt_secret returns 401
-    let bad_proof = make_agent_jwt("discover-agent", "wrong-secret");
+    // Signature signed by an unrelated keypair must be rejected.
+    let imposter = AgentKeypair::new();
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": bad_proof,
-                "context": {"project_name": "test", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &imposter,
+                "discover-agent",
+                "test",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -392,21 +431,20 @@ async fn test_discover_requires_valid_auth() {
 
 #[tokio::test]
 async fn test_discover_partial_match() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {
-                    "project_name": "partial-project",
-                    "file_content": "OPENAI_API_KEY=\nMISSING_KEY="
-                }
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "partial-project",
+                "OPENAI_API_KEY=\nMISSING_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -422,21 +460,20 @@ async fn test_discover_partial_match() {
 
 #[tokio::test]
 async fn test_get_secrets_with_valid_token() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {
-                    "project_name": "my-project",
-                    "file_content": "OPENAI_API_KEY=\nDASHSCOPE_API_KEY="
-                }
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "my-project",
+                "OPENAI_API_KEY=\nDASHSCOPE_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -461,18 +498,20 @@ async fn test_get_secrets_with_valid_token() {
 
 #[tokio::test]
 async fn test_get_secrets_invalid_token() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "guarded-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "guarded-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -493,7 +532,7 @@ async fn test_get_secrets_invalid_token() {
 
 #[tokio::test]
 async fn test_get_config_template() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let template = "[smtp]\npassword = {{openai_api_key}}\nhost = mail.example.com";
     let req = Request::builder()
@@ -517,11 +556,13 @@ async fn test_get_config_template() {
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "mail-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "mail-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -550,50 +591,44 @@ async fn test_get_config_template() {
 
 #[tokio::test]
 async fn test_discover_conflict_on_rediscover() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
-    let make_discover_req = |proof: &str, regenerate: bool| {
-        let mut body = json!({
-            "agent_id": "discover-agent",
-            "auth_proof": proof,
-            "context": {
-                "project_name": "conflict-project",
-                "file_content": "OPENAI_API_KEY="
-            }
-        });
-        if regenerate {
-            body["regenerate_token"] = json!(true);
-        }
-        body.to_string()
+    let body = |regenerate: bool| {
+        discover_body(
+            &keypair,
+            "discover-agent",
+            "conflict-project",
+            "OPENAI_API_KEY=",
+            regenerate,
+        )
+        .to_string()
     };
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .body(Body::from(make_discover_req(&auth_proof, false)))
+        .body(Body::from(body(false)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Second discover of same project without regenerate_token → conflict
-    let proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .body(Body::from(make_discover_req(&proof2, false)))
+        .body(Body::from(body(false)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // With regenerate_token=true → OK and new token
-    let proof3 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
-        .body(Body::from(make_discover_req(&proof3, true)))
+        .body(Body::from(body(true)))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -635,18 +670,8 @@ async fn test_namespace_isolation() {
     app.clone().oneshot(req).await.unwrap();
 
     // Create agent in "default" namespace
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "default-agent", "jwt_secret": "default-secret"}).to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
-
-    let auth_proof = make_agent_jwt("default-agent", "default-secret");
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "default-agent", &keypair.pub_b64()).await;
 
     // Discover: default-agent should only see "default_secret", not "prod_secret"
     let req = Request::builder()
@@ -654,11 +679,13 @@ async fn test_namespace_isolation() {
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "default-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "ns-test", "file_content": "PROD_SECRET=\nDEFAULT_SECRET="}
-            })
+            discover_body(
+                &keypair,
+                "default-agent",
+                "ns-test",
+                "PROD_SECRET=\nDEFAULT_SECRET=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -711,18 +738,8 @@ async fn test_policy_denies_path() {
     app.clone().oneshot(req).await.unwrap();
 
     // Create agent
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "policy-agent", "jwt_secret": "policy-secret"}).to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
-
-    let auth_proof = make_agent_jwt("policy-agent", "policy-secret");
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "policy-agent", &keypair.pub_b64()).await;
 
     // Discover: denied_key should not be mapped
     let req = Request::builder()
@@ -730,11 +747,13 @@ async fn test_policy_denies_path() {
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "policy-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "policy-project", "file_content": "ALLOWED_KEY=\nDENIED_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "policy-agent",
+                "policy-project",
+                "ALLOWED_KEY=\nDENIED_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -750,7 +769,7 @@ async fn test_policy_denies_path() {
 
 #[tokio::test]
 async fn test_audit_log_list() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     // Perform a discover to generate an audit log entry
     let req = Request::builder()
@@ -758,11 +777,13 @@ async fn test_audit_log_list() {
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "audit-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "audit-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -787,7 +808,7 @@ async fn test_audit_log_list() {
 
 #[tokio::test]
 async fn test_rotate_key() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     // Discover first to register a project
     let req = Request::builder()
@@ -795,11 +816,13 @@ async fn test_rotate_key() {
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "rotate-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "rotate-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -822,7 +845,6 @@ async fn test_rotate_key() {
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["rotated"], true);
     assert!(body["secrets_rewrapped"].as_u64().unwrap() > 0);
-    assert!(body["agents_rewrapped"].as_u64().unwrap() > 0);
     assert!(body["new_kek_version"].as_u64().unwrap() >= 2);
 
     // Project token still exists (not rotated)
@@ -840,17 +862,23 @@ async fn test_rotate_key() {
 
 // ====================== TOKEN LIFECYCLE TESTS ======================
 
-async fn discover_for(app: &axum::Router, auth_proof: &str, project: &str) -> (String, String) {
+async fn discover_for(
+    app: &axum::Router,
+    keypair: &AgentKeypair,
+    project: &str,
+) -> (String, String) {
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": project, "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                keypair,
+                "discover-agent",
+                project,
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -864,18 +892,20 @@ async fn discover_for(app: &axum::Router, auth_proof: &str, project: &str) -> (S
 
 #[tokio::test]
 async fn test_discover_returns_token_expiration_metadata() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "lifecycle-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "lifecycle-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -889,9 +919,9 @@ async fn test_discover_returns_token_expiration_metadata() {
 
 #[tokio::test]
 async fn test_revoke_project_token_blocks_secrets_access() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
-    let (token, _) = discover_for(&app, &auth_proof, "revoke-project").await;
+    let (token, _) = discover_for(&app, &keypair, "revoke-project").await;
 
     // Sanity check: token works.
     let req = Request::builder()
@@ -944,9 +974,9 @@ async fn test_revoke_unknown_project_returns_404() {
 
 #[tokio::test]
 async fn test_auto_rotation_after_revoke_via_discover() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
-    let (original_token, _) = discover_for(&app, &auth_proof, "auto-rot-project").await;
+    let (original_token, _) = discover_for(&app, &keypair, "auto-rot-project").await;
 
     // Revoke the token.
     let req = Request::builder()
@@ -958,17 +988,18 @@ async fn test_auto_rotation_after_revoke_via_discover() {
     app.clone().oneshot(req).await.unwrap();
 
     // Re-discover WITHOUT regenerate_token=true should still succeed (auto-rotation).
-    let proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": proof2,
-                "context": {"project_name": "auto-rot-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "auto-rot-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -991,9 +1022,9 @@ async fn test_auto_rotation_after_revoke_via_discover() {
 
 #[tokio::test]
 async fn test_admin_projects_list_includes_token_status() {
-    let (app, auth_proof) = setup_app_with_secrets().await;
+    let (app, keypair) = setup_app_with_secrets().await;
 
-    discover_for(&app, &auth_proof, "status-project").await;
+    discover_for(&app, &keypair, "status-project").await;
 
     let req = Request::builder()
         .method("GET")
@@ -1043,17 +1074,8 @@ async fn test_expired_token_returns_token_expired_error_code() {
     let app = build_router(state);
 
     // Seed an agent + secret + project via the admin/discover endpoints.
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "discover-agent", "jwt_secret": "discover-jwt-secret"})
-                .to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "discover-agent", &keypair.pub_b64()).await;
 
     let req = Request::builder()
         .method("POST")
@@ -1067,8 +1089,7 @@ async fn test_expired_token_returns_token_expired_error_code() {
         .unwrap();
     app.clone().oneshot(req).await.unwrap();
 
-    let auth_proof = make_agent_jwt("discover-agent", "discover-jwt-secret");
-    let (token, _) = discover_for(&app, &auth_proof, "expiry-project").await;
+    let (token, _) = discover_for(&app, &keypair, "expiry-project").await;
 
     // Backdate the token expiry to one minute ago.
     sqlx::query(
@@ -1091,17 +1112,18 @@ async fn test_expired_token_returns_token_expired_error_code() {
     assert_eq!(body["error_code"], "token_expired");
 
     // Re-discover should auto-rotate (no regenerate_token=true needed).
-    let auth_proof2 = make_agent_jwt("discover-agent", "discover-jwt-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "discover-agent",
-                "auth_proof": auth_proof2,
-                "context": {"project_name": "expiry-project", "file_content": "OPENAI_API_KEY="}
-            })
+            discover_body(
+                &keypair,
+                "discover-agent",
+                "expiry-project",
+                "OPENAI_API_KEY=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -1311,16 +1333,8 @@ async fn test_honey_token_access_revokes_project_token() {
     let app = setup_test_app().await;
 
     // Register an agent and a regular + honey secret in the default namespace.
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "honey-agent", "jwt_secret": "honey-secret"}).to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "honey-agent", &keypair.pub_b64()).await;
 
     for body in [
         json!({"key_path": "real_key", "secret_type": "KEY_VALUE", "value": "v"}),
@@ -1339,17 +1353,18 @@ async fn test_honey_token_access_revokes_project_token() {
         );
     }
 
-    let auth_proof = make_agent_jwt("honey-agent", "honey-secret");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({
-                "agent_id": "honey-agent",
-                "auth_proof": auth_proof,
-                "context": {"project_name": "honey-proj", "file_content": "REAL_KEY=\nFAKE_AWS_ROOT="}
-            })
+            discover_body(
+                &keypair,
+                "honey-agent",
+                "honey-proj",
+                "REAL_KEY=\nFAKE_AWS_ROOT=",
+                false,
+            )
             .to_string(),
         ))
         .unwrap();
@@ -1473,28 +1488,9 @@ async fn test_jwks_endpoint_exposes_server_pubkey() {
 
 #[tokio::test]
 async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
-
     let app = setup_test_app().await;
-
-    // Generate a fresh keypair for the test agent.
-    let signing = SigningKey::generate(&mut OsRng);
-    let pub_b64 = B64.encode(signing.verifying_key().to_bytes());
-
-    // Register the agent with agent_pub (no jwt_secret).
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "ed-agent", "agent_pub": pub_b64}).to_string(),
-        ))
-        .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "ed-agent", &keypair.pub_b64()).await;
 
     // Seed a secret so the discover scope is non-empty.
     let req = Request::builder()
@@ -1511,12 +1507,7 @@ async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Sign auth_proof and discover with signed_token=true.
-    let ts = chrono::Utc::now().timestamp();
-    let nonce = "test-nonce-1";
-    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, "ed-agent");
-    let sig = signing.sign(message.as_bytes());
-    let auth_proof = B64.encode(sig.to_bytes());
-
+    let (ts, nonce, auth_proof) = keypair.sign_for("ed-agent");
     let req = Request::builder()
         .method("POST")
         .uri("/agent/discover")
@@ -1558,31 +1549,16 @@ async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
 
 #[tokio::test]
 async fn test_ed25519_discover_rejects_skewed_timestamp() {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
-    use ed25519_dalek::{Signer, SigningKey};
-    use rand_core::OsRng;
-
     let app = setup_test_app().await;
-    let signing = SigningKey::generate(&mut OsRng);
-    let pub_b64 = B64.encode(signing.verifying_key().to_bytes());
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "ed-agent-skew", "agent_pub": pub_b64}).to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "ed-agent-skew", &keypair.pub_b64()).await;
 
     // 1 hour in the past — outside the ±5-minute window.
     let ts = chrono::Utc::now().timestamp() - 3600;
     let nonce = "old";
     let message = format!("{}|{}|{}|/agent/discover", ts, nonce, "ed-agent-skew");
-    let sig = signing.sign(message.as_bytes());
-    let auth_proof = B64.encode(sig.to_bytes());
+    let sig = keypair.signing.sign(message.as_bytes());
+    let auth_proof = B64URL.encode(sig.to_bytes());
 
     let req = Request::builder()
         .method("POST")
@@ -1734,16 +1710,8 @@ async fn test_device_authorize_flow() {
     let app = setup_test_app().await;
 
     // Pre-register the agent so approval can bind to it.
-    let req = Request::builder()
-        .method("POST")
-        .uri("/admin/agents")
-        .header("content-type", "application/json")
-        .header("x-admin-token", "test-admin-token")
-        .body(Body::from(
-            json!({"agent_id": "device-agent", "jwt_secret": "x"}).to_string(),
-        ))
-        .unwrap();
-    app.clone().oneshot(req).await.unwrap();
+    let keypair = AgentKeypair::new();
+    register_agent(&app, "device-agent", &keypair.pub_b64()).await;
 
     // Step 1: device requests authorization.
     let req = Request::builder()

@@ -32,7 +32,7 @@ Yes.
 ## 3. Session Token vs Project Token
 
 **Issue**: There are currently two separate auth flows:
-1. Agent auth flow: `jwt_secret` → session_token (1-hour expiry)
+1. Agent auth flow: Ed25519 `auth_proof` → session_token (1-hour expiry)
 2. Project flow: `project_token` (no expiry, permanent until regenerated)
 
 The session_token from agent authentication is not currently used to gate `/agent/secrets` or `/agent/config`. Only the `project_token` is used there.
@@ -167,16 +167,18 @@ recovery-boot events. Tracked under #20.
 
 ## 13. Ed25519 Agent Identity (April 2026)
 
-**Resolved (basic)**. The migration `007_ed25519_and_devices.sql` adds an `agent_pub`
-column to `agents`. Registration (`POST /admin/agents`) accepts either:
+**Resolved.** Every agent authenticates with an Ed25519 keypair. Migration
+`007_ed25519_and_devices.sql` introduced the `agent_pub` column;
+`008_drop_legacy_jwt_secret.sql` made it `NOT NULL` and dropped the legacy
+HMAC `jwt_secret_encrypted` / `wrapped_dek` columns from `agents`. Agents
+without an Ed25519 public key were dropped during that migration and must
+re-register.
 
-- `jwt_secret` (legacy HMAC-SHA256 path — preserved for backwards compatibility), and/or
-- `agent_pub` (base64url-encoded Ed25519 public key — preferred).
-
-When an agent has `agent_pub`, `/agent/discover` requires the request body to include
+Registration (`POST /admin/agents`) requires `agent_pub` (base64url-encoded
+Ed25519 public key). `/agent/discover` requires the request body to include
 `ts` and `nonce` and verifies `auth_proof` as an Ed25519 signature over
-`ts | nonce | agent_id | /agent/discover`. The ts must be within ±5 minutes of the
-server clock (drop-replay window).
+`ts | nonce | agent_id | /agent/discover`. The ts must be within ±5 minutes
+of the server clock (drop-replay window).
 
 CLI:
 - `cortex-cli gen-key --agent-id <id>` writes a private key to
@@ -185,9 +187,6 @@ CLI:
   `{ts, nonce, auth_proof}` ready to splice into the discover body.
 
 **Still open**:
-- Forward migration: a campaign that asks every existing HMAC agent to upload a public
-  key, then purges the encrypted HMAC secret. Today both credentials can coexist on the
-  same row.
 - Replay nonce caching (an LRU of `(agent_id, nonce)` for the 5-minute window) — the
   current path only enforces the timestamp bound. Tracked in NEXT_STEPS #4.
 

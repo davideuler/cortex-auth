@@ -38,7 +38,9 @@ Authenticate as an agent and register (or refresh) a project, returning a projec
 ```json
 {
   "agent_id": "agent-claude-01",
-  "auth_proof": "<JWT signed with agent's jwt_secret>",
+  "auth_proof": "<base64url Ed25519 signature over `ts|nonce|agent_id|/agent/discover`>",
+  "ts": 1714248000,
+  "nonce": "ab12cd34ef567890",
   "context": {
     "project_name": "my-project",
     "file_content": "OPENAI_API_KEY=\nSMTP_PASSWORD=\nDATABASE_URL="
@@ -47,6 +49,8 @@ Authenticate as an agent and register (or refresh) a project, returning a projec
 }
 ```
 
+- `ts` / `nonce` / `auth_proof`: produced by `cortex-cli sign-proof`. `ts`
+  must be within ±5 minutes of the server clock (replay protection).
 - `file_content`: newline-separated `KEY=value` lines. Values are ignored; only keys are matched against stored secrets.
 - `regenerate_token`: set `true` to force a new token even if the existing token
   is still active. Note: when the existing token has already **expired** or been
@@ -122,17 +126,28 @@ Example: template `password = {{smtp_password}}` → `password = hunter2`
 
 ## cortex-cli commands
 
-### gen-token
+### gen-key
 
-Generate a JWT auth_proof locally (no server call).
+Generate a fresh Ed25519 keypair locally. Writes the private key to
+`~/.cortex/agent-<id>.key` (mode 0600) and prints the base64url public key
+to stdout — upload that to the server with `POST /admin/agents`.
 
 ```bash
-cortex-cli gen-token \
+cortex-cli gen-key \
   --agent-id <AGENT_ID> \
-  --jwt-secret <JWT_SECRET>
+  [--priv-key-file <path>]
 ```
 
-Prints the signed JWT to stdout.
+### sign-proof
+
+Sign an Ed25519 `auth_proof` for `/agent/discover` (no server call). Prints
+`{"ts","nonce","auth_proof"}` JSON to stdout.
+
+```bash
+cortex-cli sign-proof \
+  --agent-id <AGENT_ID> \
+  --priv-key-file <path>
+```
 
 ### discover
 
@@ -144,11 +159,12 @@ cortex-cli discover \
   --project <project_name> \
   --url <server_url> \
   --agent-id <AGENT_ID> \
-  --jwt-secret <JWT_SECRET> \
+  [--priv-key-file <path>] \
   [--env-file ./.env] \
   [--regenerate]
 ```
 
+`--priv-key-file` defaults to `~/.cortex/agent-<AGENT_ID>.key`.
 `--regenerate` forces rotation even if the existing token is still active.
 
 ### run
@@ -160,7 +176,7 @@ cortex-cli run \
   --project <project_name> \
   --url <server_url> \
   [--token <project_token>] \
-  [--agent-id <AGENT_ID> --jwt-secret <JWT_SECRET>] \
+  [--agent-id <AGENT_ID> --priv-key-file <path>] \
   [--env-file ./.env] \
   [--token-file ~/.cortex-token-<project>] \
   -- <command> [args...]
@@ -169,15 +185,15 @@ cortex-cli run \
 If `--token` is omitted, the CLI reads it from `--token-file` (default
 `~/.cortex-token-<project>`). When the server returns
 `token_expired`/`token_revoked`, the CLI auto-rotates using `--agent-id` /
-`--jwt-secret` (or `CORTEX_AGENT_ID`/`CORTEX_JWT_SECRET`) and retries.
+`--priv-key-file` (or `CORTEX_AGENT_ID`/`CORTEX_PRIV_KEY_FILE`) and retries.
 
 Environment variable equivalents:
 ```bash
 export CORTEX_PROJECT=my-project
 export CORTEX_URL=http://localhost:3000
-export CORTEX_TOKEN=<project_token>           # optional, falls back to token file
-export CORTEX_AGENT_ID=agent-claude-01        # enables auto-rotation
-export CORTEX_JWT_SECRET=<secret>             # enables auto-rotation
+export CORTEX_TOKEN=<project_token>                       # optional, falls back to token file
+export CORTEX_AGENT_ID=agent-claude-01                    # enables auto-rotation
+export CORTEX_PRIV_KEY_FILE=$HOME/.cortex/agent-claude-01.key
 cortex-cli run -- <command> [args...]
 ```
 
@@ -235,11 +251,14 @@ Create a secret:
 ```
 
 ### POST /admin/agents
-Register an agent:
+Register an agent. `agent_pub` is the base64url-encoded Ed25519 public key
+printed by `cortex-cli gen-key` — the matching private key never leaves the
+agent's machine.
+
 ```json
 {
   "agent_id": "agent-claude-01",
-  "jwt_secret": "<32-byte hex>",
+  "agent_pub": "<base64url Ed25519 public key>",
   "description": "Claude autonomous agent",
   "namespace": "default"
 }
