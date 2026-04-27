@@ -9,9 +9,10 @@ A lightweight, Rust-based secrets vault designed for AI agents and automated pip
 ```
                       ┌──────────────────────────────────────┐
                       │           cortex-server              │
-         admin API    │  · stores secrets  (AES-256-GCM)     │
-  Admin ─────────────►│  · authenticates agents  (JWT)       │
-  (curl / API)        │  · issues project tokens             │
+         admin API    │  · KEK in mlock'd memory (operator)  │
+  Admin ─────────────►│  · per-row DEKs wrapped by KEK       │
+  (curl / API)        │  · authenticates agents  (JWT)       │
+                      │  · issues project tokens             │
                       └───────────────┬──────────────────────┘
                                       │  ② project_token
                                       │  ③ env vars
@@ -109,15 +110,19 @@ cargo build --release
 ## Quick Start
 
 ```bash
-# Generate keys
-ENCRYPTION_KEY=$(openssl rand -hex 32)
+# Generate the admin token (the KEK is derived from an operator passphrase you type at startup)
 ADMIN_TOKEN=$(openssl rand -hex 16)
 
-# Start the server
+# Start the server. It boots SEALED and prompts for the KEK operator password
+# on stdin. After the password unwraps the on-disk sentinel the server
+# transitions to UNSEALED and starts listening on :3000.
 DATABASE_URL=sqlite://cortex-auth.db \
-ENCRYPTION_KEY=$ENCRYPTION_KEY \
 ADMIN_TOKEN=$ADMIN_TOKEN \
 cortex-server
+# [cortex-server SEALED] Enter KEK operator password: ********
+
+# (Headless deployments — supply the password via env var instead of stdin.)
+# CORTEX_KEK_PASSWORD='strong-passphrase' cortex-server
 
 # In another terminal — add a secret
 curl -X POST http://localhost:3000/admin/secrets \
@@ -212,10 +217,78 @@ cargo build --release
 
 ## Security Model
 
-- Secrets encrypted at rest with AES-256-GCM (unique nonce per write)
-- Agent JWT secrets stored encrypted; project tokens stored as SHA-256 hashes
+### Envelope Encryption with Operator-Held KEK
+
+CortexAuth uses a two-tier key hierarchy. The **KEK** (Key Encryption Key) lives only in the
+operator's head and in process memory; the DB never stores it. Every secret is encrypted with
+its own random **DEK** (Data Encryption Key); the DEK is then wrapped with the KEK and stored
+beside the ciphertext. The plaintext DEK is zeroized as soon as the row is written.
+
+#### Server boot — SEALED → UNSEALED
+
+```
+1. cortex-server starts in SEALED state — no listener yet
+2. Operator types the KEK password (stdin) or supplies CORTEX_KEK_PASSWORD
+3. Server derives KEK = Argon2id(password, salt_from_DB) and mlocks it
+4. Server reads the sentinel ciphertext, decrypts it with KEK, compares to
+   the known plaintext → proves the password matches the prior KEK
+5. Server transitions to UNSEALED and binds :3000
+```
+
+A wrong password fails the sentinel check and the process exits without ever opening the listener.
+On first boot the sentinel is generated and stored automatically.
+
+#### Write path (admin adds a secret)
+
+```
+plaintext = "sk-abc123..."
+
+step 1  DEK         = random_bytes(32)
+step 2  ciphertext  = AES-256-GCM(DEK, nonce_d, plaintext)
+step 3  wrapped_DEK = AES-256-GCM(KEK, nonce_k, DEK)
+step 4  INSERT INTO secrets(ciphertext, wrapped_DEK, kek_version, ...)
+step 5  zeroize(DEK, plaintext)
+```
+
+#### Read path (agent fetches a secret)
+
+```
+step 1  SELECT ciphertext, wrapped_DEK
+step 2  DEK       = AES-256-GCM-Decrypt(KEK, nonce_k, wrapped_DEK)
+step 3  plaintext = AES-256-GCM-Decrypt(DEK, nonce_d, ciphertext)
+step 4  return plaintext; zeroize intermediate DEK copies
+```
+
+Compromise of the DB alone does not leak any secret — the wrapped DEKs are useless without the KEK,
+which is only ever in the running server's memory.
+
+### Namespaces
+
+Namespaces partition secrets, agents, projects, and configs. An agent registered in namespace
+`prod` only sees secrets in `prod`; the same agent ID in `staging` sees a different set. Manage
+namespaces from the dashboard (`Namespaces` tab) or the admin API:
+
+```bash
+curl -X POST http://localhost:3000/admin/namespaces \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"staging","description":"Pre-prod environment"}'
+
+# Tag a secret/agent at create-time:
+curl -X POST http://localhost:3000/admin/secrets \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-...","namespace":"staging"}'
+```
+
+The `default` namespace is created automatically and cannot be deleted. A namespace that still
+owns secrets/agents/projects refuses deletion.
+
+### Other guarantees
+
+- AES-256-GCM with a unique nonce per write for both DEK→body and KEK→DEK steps
+- Project tokens hashed with SHA-256 (the raw token is never stored)
 - Admin operations protected by static `ADMIN_TOKEN`
 - `/agent/discover` authenticates agents directly via signed JWT (no separate session token)
 - Project access via one-time-issued `project_token` (must be saved — cannot be recovered)
 - Full audit log of all secret accesses
 - `cortex-cli` uses `exec()` — secrets never visible to a parent process
+- KEK rotation: `POST /admin/rotate-key {"new_kek_password": "..."}` re-wraps every DEK with the new KEK and bumps `kek_version`. Body ciphertexts are untouched.

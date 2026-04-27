@@ -56,8 +56,10 @@
 14. **Health check endpoint**
     Add `GET /health` returning `{"status": "ok", "db": "ok"}` for load balancer / uptime monitoring.
 
-15. **Key rotation utility**
-    Implement a `cortex-server rotate-key --new-key <hex>` subcommand that re-encrypts all secrets under a new ENCRYPTION_KEY atomically.
+15. **Key rotation utility** *(implemented)*
+    `POST /admin/rotate-key {"new_kek_password": "..."}` re-derives the KEK from a new
+    operator passphrase and re-wraps every per-row DEK in a single transaction. Body
+    ciphertexts are untouched. Restart the server with the new passphrase afterward.
 
 16. **Audit log query API**
     Add `GET /admin/audit-logs?project=&action=&since=` for querying audit history from the admin interface.
@@ -72,8 +74,9 @@
 18. **PostgreSQL support**
     Make the database backend configurable — sqlx already supports PostgreSQL with just a feature flag change in Cargo.toml. This unlocks multi-instance deployments.
 
-19. **Secret namespacing / tagging**
-    Add `namespace` and `tags` fields to secrets to organize large secret collections and enable namespace-level access control.
+19. **Secret namespacing / tagging** *(namespacing implemented)*
+    Namespaces partition secrets, agents, and projects; manage them via `/admin/namespaces`
+    or the dashboard "Namespaces" tab. Free-form tagging is still TBD.
 
 20. **Config file watcher**
     Allow the server to reload its non-sensitive config (port, log level) from a config file on SIGHUP without restarting.
@@ -86,7 +89,7 @@
 ## Security Hardening Checklist
 
 - [ ] All admin endpoints behind a network firewall — not exposed to the internet
-- [ ] `ENCRYPTION_KEY` and `ADMIN_TOKEN` loaded from a secrets manager (AWS SSM, Vault, etc.), not `.env` files on disk
+- [ ] `CORTEX_KEK_PASSWORD` and `ADMIN_TOKEN` loaded from a secrets manager (AWS SSM, Vault, etc.), not `.env` files on disk
 - [ ] Server process runs as a dedicated non-root user
 - [ ] SQLite database file permissions: `chmod 600 cortex-auth.db`
 - [ ] Enable SQLite WAL mode for better concurrency: `PRAGMA journal_mode=WAL`

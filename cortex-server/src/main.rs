@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use cortex_server::{build_router, config::AppConfig, db, state::AppState};
+use cortex_server::{build_router, config::AppConfig, config::read_kek_password, db, kek, state::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -18,8 +18,21 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+
+    // Server boots in SEALED state. We open the DB to read the KEK sentinel
+    // before opening the public listener — if the operator password is wrong
+    // the process exits without ever binding :3000.
     let pool = db::create_pool(&config.database_url).await?;
     db::run_migrations(&pool).await?;
+
+    tracing::info!("cortex-server SEALED — awaiting KEK operator password");
+    let password = read_kek_password()?;
+    let unsealed = kek::unseal(&pool, &password).await?;
+    drop(password); // hand off; original String left scope, KEK lives in `unsealed`.
+    tracing::info!(
+        "cortex-server UNSEALED (kek_version={})",
+        unsealed.kek_version
+    );
 
     // Daily cleanup: remove audit logs older than 60 days
     let cleanup_pool = pool.clone();
@@ -39,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let state = AppState::new(pool, config.clone());
+    let state = AppState::new(pool, config.clone(), unsealed.kek);
     let app = build_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
 

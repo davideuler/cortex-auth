@@ -5,6 +5,8 @@ pub struct Agent {
     pub id: String,
     pub agent_id: String,
     pub jwt_secret_encrypted: String,
+    pub wrapped_dek: Option<String>,
+    pub kek_version: i64,
     pub description: Option<String>,
     pub namespace: String,
     pub created_at: String,

@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
-    pub encryption_key: [u8; 32],
     pub admin_token: String,
     pub port: u16,
     pub tls_cert_file: Option<String>,
@@ -14,12 +13,6 @@ impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "sqlite://cortex-auth.db".to_string());
-
-        let encryption_key_hex = std::env::var("ENCRYPTION_KEY")
-            .context("ENCRYPTION_KEY env var is required (64 hex chars = 32 bytes)")?;
-
-        let encryption_key = parse_hex_key(&encryption_key_hex)
-            .context("ENCRYPTION_KEY must be exactly 64 hex characters")?;
 
         let admin_token =
             std::env::var("ADMIN_TOKEN").context("ADMIN_TOKEN env var is required")?;
@@ -34,7 +27,6 @@ impl AppConfig {
 
         Ok(AppConfig {
             database_url,
-            encryption_key,
             admin_token,
             port,
             tls_cert_file,
@@ -43,12 +35,8 @@ impl AppConfig {
     }
 
     pub fn test_config() -> Self {
-        let mut key = [0u8; 32];
-        key[..16].copy_from_slice(b"test_encrypt_key");
-        key[16..].copy_from_slice(b"test_encrypt_key");
         AppConfig {
             database_url: "sqlite::memory:".to_string(),
-            encryption_key: key,
             admin_token: "test-admin-token".to_string(),
             port: 3000,
             tls_cert_file: None,
@@ -57,12 +45,20 @@ impl AppConfig {
     }
 }
 
-pub fn parse_hex_key(hex: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex).context("Invalid hex string")?;
-    if bytes.len() != 32 {
-        anyhow::bail!("Key must be 32 bytes, got {}", bytes.len());
+/// Read the operator KEK password from $CORTEX_KEK_PASSWORD if set, otherwise
+/// prompt the operator interactively on stdin (echo disabled). Whitespace is
+/// stripped on both sides.
+pub fn read_kek_password() -> Result<String> {
+    if let Ok(p) = std::env::var("CORTEX_KEK_PASSWORD") {
+        let p = p.trim().to_string();
+        anyhow::ensure!(!p.is_empty(), "CORTEX_KEK_PASSWORD is set but empty");
+        return Ok(p);
     }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&bytes);
-    Ok(key)
+    let pwd = rpassword::prompt_password(
+        "[cortex-server SEALED] Enter KEK operator password: ",
+    )
+    .context("Failed to read KEK password from stdin")?;
+    let pwd = pwd.trim().to_string();
+    anyhow::ensure!(!pwd.is_empty(), "Empty KEK password rejected");
+    Ok(pwd)
 }

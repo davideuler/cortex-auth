@@ -33,6 +33,9 @@ tower = "0.4"
 sha2 = "0.10"
 hex = "0.4"
 subtle = "2"
+zeroize = { version = "1", features = ["derive"] }
+rpassword = "7"
+libc = "0.2"
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 tokio-rustls = "0.24"

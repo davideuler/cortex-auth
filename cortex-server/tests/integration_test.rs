@@ -6,13 +6,14 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use cortex_server::{build_router, config::AppConfig, db, state::AppState};
+use cortex_server::{build_router, config::AppConfig, db, kek, state::AppState};
 
 async fn setup_test_app() -> axum::Router {
     let config = AppConfig::test_config();
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
-    let state = AppState::new(pool, config);
+    let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
+    let state = AppState::new(pool, config, unsealed.kek);
     build_router(state)
 }
 
@@ -805,27 +806,23 @@ async fn test_rotate_key() {
     let body = body_json(resp.into_body()).await;
     let project_token = body["project_token"].as_str().unwrap().to_string();
 
-    // Rotate key with a new 32-byte hex key
-    let new_key = "a".repeat(64); // 64 hex chars = 32 bytes
+    // Rotate KEK with a new operator password.
     let req = Request::builder()
         .method("POST")
         .uri("/admin/rotate-key")
         .header("content-type", "application/json")
         .header("x-admin-token", "test-admin-token")
         .body(Body::from(
-            json!({"new_encryption_key": new_key}).to_string(),
+            json!({"new_kek_password": "new-operator-password"}).to_string(),
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["rotated"], true);
-    assert!(body["secrets_updated"].as_u64().unwrap() > 0);
-
-    // After rotation, the old server config key is stale — secrets are re-encrypted with new_key.
-    // The server must restart with the new ENCRYPTION_KEY to read them correctly.
-    // For the test, we just verify the rotation endpoint returns success and row counts.
-    assert!(body["agents_updated"].as_u64().unwrap() > 0);
+    assert!(body["secrets_rewrapped"].as_u64().unwrap() > 0);
+    assert!(body["agents_rewrapped"].as_u64().unwrap() > 0);
+    assert!(body["new_kek_version"].as_u64().unwrap() >= 2);
 
     // Project token still exists (not rotated)
     let req = Request::builder()
@@ -1032,14 +1029,15 @@ async fn test_admin_projects_list_includes_token_status() {
 
 #[tokio::test]
 async fn test_expired_token_returns_token_expired_error_code() {
-    use cortex_server::{build_router, config::AppConfig, db, state::AppState};
+    use cortex_server::{build_router, config::AppConfig, db, kek, state::AppState};
 
     // Build app on a pool we keep a handle to, so we can backdate the token
     // expiry directly in SQL to simulate the 120-minute boundary elapsing.
     let config = AppConfig::test_config();
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
-    let state = AppState::new(pool.clone(), config);
+    let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
+    let state = AppState::new(pool.clone(), config, unsealed.kek);
     let app = build_router(state);
 
     // Seed an agent + secret + project via the admin/discover endpoints.
@@ -1142,4 +1140,197 @@ async fn test_token_status_helper() {
 
     p.token_revoked_at = Some("2026-01-01 00:00:00".into());
     assert_eq!(p.token_status(), "revoked");
+}
+
+// ====================== KEK SENTINEL TESTS ======================
+
+#[tokio::test]
+async fn test_kek_sentinel_rejects_wrong_password() {
+    let pool = db::create_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+
+    // First boot — initializes the sentinel.
+    let _ = cortex_server::kek::unseal(&pool, "first-password").await.unwrap();
+
+    // Second boot with the right password — succeeds.
+    let _ = cortex_server::kek::unseal(&pool, "first-password").await.unwrap();
+
+    // Wrong password — sentinel verification fails.
+    let res = cortex_server::kek::unseal(&pool, "WRONG-password").await;
+    assert!(res.is_err(), "wrong KEK password must be rejected");
+}
+
+#[tokio::test]
+async fn test_envelope_each_secret_has_unique_wrapped_dek() {
+    use cortex_server::config::AppConfig;
+    use cortex_server::state::AppState;
+
+    let config = AppConfig::test_config();
+    let pool = db::create_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    let unsealed = cortex_server::kek::unseal(&pool, "test-operator-password")
+        .await
+        .unwrap();
+    let app = build_router(AppState::new(pool.clone(), config, unsealed.kek));
+
+    for (path, val) in [("a_key", "value-a"), ("b_key", "value-b")] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/admin/secrets")
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from(
+                json!({"key_path": path, "secret_type": "KEY_VALUE", "value": val}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Two stored rows must each have their own wrapped_dek (envelope encryption).
+    let rows: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT key_path, wrapped_dek FROM secrets ORDER BY key_path")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    let dek_a = rows[0].1.as_deref().expect("a_key wrapped_dek must be set");
+    let dek_b = rows[1].1.as_deref().expect("b_key wrapped_dek must be set");
+    assert_ne!(dek_a, dek_b, "each secret must wrap its own random DEK");
+}
+
+// ====================== NAMESPACE CRUD TESTS ======================
+
+#[tokio::test]
+async fn test_namespace_crud_lifecycle() {
+    let app = setup_test_app().await;
+
+    // 'default' namespace seeded by migration.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/namespaces")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    assert!(list.iter().any(|n| n["name"] == "default"));
+
+    // Create a new namespace.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/namespaces")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"name": "staging", "description": "Pre-prod env"}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Conflict on duplicate.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/namespaces")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({"name": "staging"}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Cannot delete 'default'.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/admin/namespaces/default")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Delete 'staging' (empty).
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/admin/namespaces/staging")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_namespace_in_use_blocks_delete() {
+    let app = setup_test_app().await;
+
+    // Create ns + a secret inside it.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/namespaces")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({"name": "occupied"}).to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({
+                "key_path": "x", "secret_type": "KEY_VALUE",
+                "value": "v", "namespace": "occupied"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    // Refuse to delete a namespace that still owns rows.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/admin/namespaces/occupied")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_creating_secret_in_new_namespace_auto_registers_it() {
+    let app = setup_test_app().await;
+
+    // Drop a secret in a not-yet-declared namespace; the API must auto-register
+    // the namespace so the registry stays in sync with referenced rows.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({
+                "key_path": "auto", "secret_type": "KEY_VALUE",
+                "value": "v", "namespace": "auto-ns"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/namespaces")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    assert!(list.iter().any(|n| n["name"] == "auto-ns"));
 }

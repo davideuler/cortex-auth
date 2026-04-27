@@ -36,6 +36,9 @@ pub fn project_router() -> Router<AppState> {
 }
 
 const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
+const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, created_at, updated_at FROM secrets";
+const AGENT_SELECT_FULL: &str =
+    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     headers
@@ -97,19 +100,31 @@ fn format_sqlite_timestamp(t: chrono::DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn open_secret_value(
+    state: &AppState,
+    s: &crate::models::secret::Secret,
+) -> Option<String> {
+    let wrapped = s.wrapped_dek.as_deref()?;
+    crypto::open_envelope(&s.encrypted_value, wrapped, &state.kek).ok()
+}
+
 async fn discover(
     State(state): State<AppState>,
     Json(req): Json<DiscoverRequest>,
 ) -> Result<Json<DiscoverResponse>, AppError> {
     let agent = sqlx::query_as::<_, Agent>(
-        "SELECT id, agent_id, jwt_secret_encrypted, description, namespace, created_at FROM agents WHERE agent_id = ?",
+        &format!("{} WHERE agent_id = ?", AGENT_SELECT_FULL),
     )
     .bind(&req.agent_id)
     .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
 
-    let jwt_secret = crypto::decrypt(&agent.jwt_secret_encrypted, &state.config.encryption_key)
+    let wrapped = agent
+        .wrapped_dek
+        .as_deref()
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
+    let jwt_secret = crypto::open_envelope(&agent.jwt_secret_encrypted, wrapped, &state.kek)
         .map_err(AppError::Internal)?;
 
     let mut validation = Validation::new(Algorithm::HS256);
@@ -147,7 +162,10 @@ async fn discover(
         .collect();
 
     let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(
-        "SELECT id, key_path, secret_type, encrypted_value, description, namespace, created_at, updated_at FROM secrets WHERE secret_type = 'KEY_VALUE' AND namespace = ?",
+        &format!(
+            "{} WHERE secret_type = 'KEY_VALUE' AND namespace = ?",
+            SECRET_SELECT_FULL
+        ),
     )
     .bind(&namespace)
     .fetch_all(&state.pool)
@@ -185,9 +203,6 @@ async fn discover(
     let expires_at_str = format_sqlite_timestamp(expires_at);
 
     let project_token = if let Some(existing_proj) = &existing {
-        // Auto-rotate when caller explicitly asks, OR when the existing token is
-        // already expired/revoked. This means an agent re-running discover after
-        // a 120-minute idle window seamlessly receives a fresh token.
         let status = existing_proj.token_status();
         let auto_rotate = status == "expired" || status == "revoked";
 
@@ -287,8 +302,6 @@ async fn get_project_by_token(
         return Err(AppError::Unauthorized("Invalid project token".into()));
     }
 
-    // Reject revoked tokens before checking expiration so the caller gets the
-    // most actionable error code.
     if project.token_revoked_at.is_some() {
         audit::write(
             state,
@@ -331,7 +344,10 @@ async fn get_secrets(
 
     for (env_var, secret_path) in &mappings {
         let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
-            "SELECT id, key_path, secret_type, encrypted_value, description, namespace, created_at, updated_at FROM secrets WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
+            &format!(
+                "{} WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
+                SECRET_SELECT_FULL
+            ),
         )
         .bind(secret_path.as_str())
         .bind(&project.namespace)
@@ -339,7 +355,7 @@ async fn get_secrets(
         .await?;
 
         if let Some(s) = secret {
-            if let Ok(val) = crypto::decrypt(&s.encrypted_value, &state.config.encryption_key) {
+            if let Some(val) = open_secret_value(&state, &s) {
                 env_vars.insert(env_var.clone(), val);
             }
         }
@@ -367,7 +383,10 @@ async fn get_config(
     let project = get_project_by_token(&state, &project_name, &token).await?;
 
     let template_secret = sqlx::query_as::<_, crate::models::secret::Secret>(
-        "SELECT id, key_path, secret_type, encrypted_value, description, namespace, created_at, updated_at FROM secrets WHERE key_path = ? AND secret_type = 'TEMPLATE_CONFIG' AND namespace = ?",
+        &format!(
+            "{} WHERE key_path = ? AND secret_type = 'TEMPLATE_CONFIG' AND namespace = ?",
+            SECRET_SELECT_FULL
+        ),
     )
     .bind(&app_name)
     .bind(&project.namespace)
@@ -375,15 +394,18 @@ async fn get_config(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Template '{}' not found", app_name)))?;
 
-    let template_content =
-        crypto::decrypt(&template_secret.encrypted_value, &state.config.encryption_key)
-            .map_err(AppError::Internal)?;
+    let template_content = open_secret_value(&state, &template_secret).ok_or_else(|| {
+        AppError::Internal(anyhow::anyhow!("Failed to decrypt template body"))
+    })?;
 
     let mappings = project.get_env_mappings();
     let mut context: HashMap<String, String> = HashMap::new();
     for secret_path in mappings.values() {
         let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
-            "SELECT id, key_path, secret_type, encrypted_value, description, namespace, created_at, updated_at FROM secrets WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
+            &format!(
+                "{} WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
+                SECRET_SELECT_FULL
+            ),
         )
         .bind(secret_path.as_str())
         .bind(&project.namespace)
@@ -391,7 +413,7 @@ async fn get_config(
         .await?;
 
         if let Some(s) = secret {
-            if let Ok(val) = crypto::decrypt(&s.encrypted_value, &state.config.encryption_key) {
+            if let Some(val) = open_secret_value(&state, &s) {
                 let normalized = secret_path.replace('/', "_");
                 context.insert(secret_path.clone(), val.clone());
                 context.insert(normalized, val);

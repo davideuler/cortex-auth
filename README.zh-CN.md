@@ -9,9 +9,10 @@
 ```
                       ┌──────────────────────────────────────┐
                       │           cortex-server              │
-         管理员 API    │  · 存储密钥（AES-256-GCM 加密）      │
-  管理员 ────────────►│  · 验证 Agent 身份（JWT）             │
-  (curl / API)        │  · 签发项目令牌                       │
+         管理员 API    │  · KEK 常驻 mlock 内存（运维持有口令） │
+  管理员 ────────────►│  · 每行数据各自的 DEK 由 KEK 包裹      │
+  (curl / API)        │  · 验证 Agent 身份（JWT）              │
+                      │  · 签发项目令牌                        │
                       └───────────────┬──────────────────────┘
                                       │  ② project_token
                                       │  ③ env vars 环境变量
@@ -109,15 +110,18 @@ cargo build --release
 ## 快速开始
 
 ```bash
-# 生成密钥
-ENCRYPTION_KEY=$(openssl rand -hex 32)
+# 生成 admin token；KEK 由启动时输入的运维口令派生（不再使用 ENCRYPTION_KEY 环境变量）
 ADMIN_TOKEN=$(openssl rand -hex 16)
 
-# 启动服务器
+# 启动服务器：进程先进入 SEALED 状态，等待运维通过 stdin 输入 KEK 口令；
+# 口令解开 DB 中的哨兵后切换到 UNSEALED 并开始监听 :3000。
 DATABASE_URL=sqlite://cortex-auth.db \
-ENCRYPTION_KEY=$ENCRYPTION_KEY \
 ADMIN_TOKEN=$ADMIN_TOKEN \
 cortex-server
+# [cortex-server SEALED] Enter KEK operator password: ********
+
+# 无人值守部署可改用环境变量传入：
+# CORTEX_KEK_PASSWORD='strong-passphrase' cortex-server
 
 # 在另一个终端——添加一个密钥
 curl -X POST http://localhost:3000/admin/secrets \
@@ -212,10 +216,72 @@ cargo build --release
 
 ## 安全模型
 
-- 密钥静态加密：AES-256-GCM，每次写入使用唯一随机数（nonce）
-- Agent JWT 密钥加密存储；项目令牌以 SHA-256 哈希形式保存
+### 信封加密 + 运维持有 KEK
+
+CortexAuth 采用两级密钥体系。**KEK**（密钥加密密钥）只存在运维大脑里和服务器进程内存中，
+DB 永不存储。每条数据使用一把独立的随机 **DEK**（数据加密密钥）加密，DEK 再被 KEK
+"包"住后与密文一起入库；DEK 明文写入完成立即在内存中清零。
+
+#### 启动流程：SEALED → UNSEALED
+
+```
+1. cortex-server 启动后处于 SEALED 状态，尚未监听端口
+2. 运维通过 stdin 输入 KEK 口令（或通过 CORTEX_KEK_PASSWORD 提供）
+3. 服务器：KEK = Argon2id(口令, DB 中的 salt)，并对该内存页执行 mlock
+4. 取库里的"哨兵密文"，用 KEK 解密 → 与已知明文比对 → 验证 KEK 正确
+5. 服务器切到 UNSEALED 并开 :3000 监听
+```
+
+口令错误时哨兵解密失败，进程退出且永不打开监听端口。首次启动时哨兵自动生成入库。
+
+#### 写入流程（admin 添加 API_KEY）
+
+```
+plaintext = "sk-abc123..."
+
+step 1   DEK         = random_bytes(32)
+step 2   ciphertext  = AES-256-GCM(DEK, nonce_d, plaintext)
+step 3   wrapped_DEK = AES-256-GCM(KEK, nonce_k, DEK)
+step 4   INSERT INTO secrets(ciphertext, wrapped_DEK, kek_version, ...)
+step 5   立即 zeroize 内存中的 DEK 和 plaintext
+```
+
+#### 读取流程（agent 拉取密钥）
+
+```
+step 1   SELECT ciphertext, wrapped_DEK
+step 2   DEK       = AES-256-GCM-Decrypt(KEK, nonce_k, wrapped_DEK)
+step 3   plaintext = AES-256-GCM-Decrypt(DEK, nonce_d, ciphertext)
+step 4   返回 plaintext，并 zeroize 中间产生的 DEK 副本
+```
+
+仅泄露 DB 文件不会泄露任何密钥——wrapped_DEK 离开 KEK 毫无用处，而 KEK 只存在运行中的服务器内存里。
+
+### Namespace（命名空间）
+
+Namespace 用于隔离密钥、Agent、项目、配置。一个注册在 `prod` 的 Agent 仅能看到 `prod` 下的密钥；
+同名 Agent 注册在 `staging` 则看到不同的集合。可通过 Dashboard 的 "Namespaces" 标签页或 admin API 管理：
+
+```bash
+curl -X POST http://localhost:3000/admin/namespaces \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"staging","description":"预发布环境"}'
+
+# 创建密钥/Agent 时显式指定 namespace：
+curl -X POST http://localhost:3000/admin/secrets \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"key_path":"openai_api_key","secret_type":"KEY_VALUE","value":"sk-...","namespace":"staging"}'
+```
+
+`default` namespace 自动创建且不可删除；仍有密钥/Agent/项目引用的 namespace 拒绝删除。
+
+### 其他保障
+
+- AES-256-GCM 全程使用唯一随机 nonce，DEK→密文 与 KEK→DEK 两层均独立 nonce
+- 项目令牌仅以 SHA-256 哈希形式存储，原始 token 不入库
 - 管理员操作通过静态 `ADMIN_TOKEN` 保护
 - `/agent/discover` 直接通过签名 JWT 验证 Agent 身份，无独立 Session 令牌
 - 项目访问使用一次性签发的 `project_token`（必须保存，无法找回，仅可重新生成）
 - 全量审计日志，记录所有密钥访问行为
 - `cortex-cli` 使用 `exec()` 启动子进程——父进程无法访问密钥
+- KEK 轮转：`POST /admin/rotate-key {"new_kek_password": "..."}` 仅重新包裹所有 DEK 并升级 `kek_version`，密文本身保持不变

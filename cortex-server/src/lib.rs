@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod dashboard;
 pub mod db;
 pub mod error;
+pub mod kek;
 pub mod models;
 pub mod state;
 
