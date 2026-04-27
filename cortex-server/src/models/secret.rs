@@ -10,6 +10,7 @@ pub struct Secret {
     pub kek_version: i64,
     pub description: Option<String>,
     pub namespace: String,
+    pub is_honey_token: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -21,12 +22,18 @@ pub struct CreateSecretRequest {
     pub value: String,
     pub description: Option<String>,
     pub namespace: Option<String>,
+    /// Mark this secret as a decoy. Any read attempt is treated as an attack
+    /// signal: the calling project's token is revoked and a high-priority
+    /// alarm row is written to the audit log.
+    #[serde(default)]
+    pub is_honey_token: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateSecretRequest {
     pub value: Option<String>,
     pub description: Option<String>,
+    pub is_honey_token: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -36,6 +43,7 @@ pub struct SecretListItem {
     pub secret_type: String,
     pub description: Option<String>,
     pub namespace: String,
+    pub is_honey_token: bool,
     pub created_at: String,
 }
 
@@ -47,6 +55,7 @@ pub struct SecretDetail {
     pub value: String,
     pub description: Option<String>,
     pub namespace: String,
+    pub is_honey_token: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -54,5 +63,9 @@ pub struct SecretDetail {
 impl Secret {
     pub fn is_valid_type(t: &str) -> bool {
         matches!(t, "KEY_VALUE" | "JSON_CONFIG" | "TEMPLATE_CONFIG")
+    }
+
+    pub fn is_honey(&self) -> bool {
+        self.is_honey_token != 0
     }
 }

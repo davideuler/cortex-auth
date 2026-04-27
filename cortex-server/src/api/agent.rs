@@ -35,8 +35,8 @@ pub fn project_router() -> Router<AppState> {
         .route("/config/:project_name/:app_name", get(get_config))
 }
 
-const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
-const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, created_at, updated_at FROM secrets";
+const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
+const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT_FULL: &str =
     "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
 
@@ -47,6 +47,36 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Unauthorized("Missing or invalid Authorization header".into()))
+}
+
+/// Extract caller metadata from optional `X-Cortex-Caller-*` headers. The CLI
+/// is expected to populate these so audit rows record exactly which process
+/// fetched a secret. All fields are advisory — a malicious caller can lie,
+/// but the audit row still pins down the network identity (source IP, agent
+/// session) that signed the request.
+fn extract_caller_context(headers: &HeaderMap) -> crate::audit::CallerContext {
+    fn h(headers: &HeaderMap, name: &str) -> Option<String> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    }
+    fn h_int(headers: &HeaderMap, name: &str) -> Option<i64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+    }
+    crate::audit::CallerContext {
+        caller_pid: h_int(headers, "x-cortex-caller-pid"),
+        caller_binary_sha256: h(headers, "x-cortex-caller-binary-sha256"),
+        caller_argv_hash: h(headers, "x-cortex-caller-argv-hash"),
+        caller_cwd: h(headers, "x-cortex-caller-cwd"),
+        caller_git_commit: h(headers, "x-cortex-caller-git-commit"),
+        source_ip: h(headers, "x-forwarded-for").or_else(|| h(headers, "x-real-ip")),
+        hostname: h(headers, "x-cortex-hostname"),
+        os: h(headers, "x-cortex-os"),
+    }
 }
 
 fn agent_matches_pattern(agent_id: &str, pattern: &str) -> bool {
@@ -202,6 +232,17 @@ async fn discover(
     let expires_at = now + Duration::minutes(DEFAULT_TOKEN_TTL_MINUTES);
     let expires_at_str = format_sqlite_timestamp(expires_at);
 
+    // Scope = the set of secret key_paths this token will be allowed to read.
+    // Frozen at discover time so re-issuing with new env_mappings cannot
+    // implicitly broaden access without going through discover again.
+    let scope_paths: Vec<String> = {
+        let mut v: Vec<String> = mapped_keys.values().cloned().collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let scope_json = serde_json::to_string(&scope_paths).unwrap();
+
     let project_token = if let Some(existing_proj) = &existing {
         let status = existing_proj.token_status();
         let auto_rotate = status == "expired" || status == "revoked";
@@ -212,11 +253,12 @@ async fn discover(
             let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
             sqlx::query(
-                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, token_expires_at = ?, token_revoked_at = NULL, updated_at = datetime('now') WHERE project_name = ?",
+                "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, scope = ?, token_expires_at = ?, token_revoked_at = NULL, updated_at = datetime('now') WHERE project_name = ?",
             )
             .bind(&hash)
             .bind(&mappings_json)
             .bind(&namespace)
+            .bind(&scope_json)
             .bind(&expires_at_str)
             .bind(project_name)
             .execute(&state.pool)
@@ -250,13 +292,14 @@ async fn discover(
         let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
         sqlx::query(
-            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, namespace, token_expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, namespace, scope, token_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(project_name)
         .bind(&hash)
         .bind(&mappings_json)
         .bind(&namespace)
+        .bind(&scope_json)
         .bind(&expires_at_str)
         .execute(&state.pool)
         .await?;
@@ -282,6 +325,7 @@ async fn discover(
         token_ttl_seconds: DEFAULT_TOKEN_TTL_MINUTES * 60,
         unmatched_keys: unmatched,
         namespace,
+        scope: scope_paths,
     }))
 }
 
@@ -337,12 +381,22 @@ async fn get_secrets(
     Path(project_name): Path<String>,
 ) -> Result<Json<SecretsResponse>, AppError> {
     let token = extract_bearer_token(&headers)?;
+    let caller = extract_caller_context(&headers);
     let project = get_project_by_token(&state, &project_name, &token).await?;
 
     let mappings = project.get_env_mappings();
+    let scope = project.get_scope();
+    let scope_set: std::collections::HashSet<&str> =
+        scope.iter().map(|s| s.as_str()).collect();
     let mut env_vars: HashMap<String, String> = HashMap::new();
 
     for (env_var, secret_path) in &mappings {
+        // Enforce the frozen-at-discover scope. Empty scope means "legacy
+        // project predating the scope column" — fall back to env_mappings.
+        if !scope_set.is_empty() && !scope_set.contains(secret_path.as_str()) {
+            continue;
+        }
+
         let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
             &format!(
                 "{} WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
@@ -355,23 +409,60 @@ async fn get_secrets(
         .await?;
 
         if let Some(s) = secret {
+            if s.is_honey() {
+                trigger_honey_token_alarm(&state, &project_name, &s.key_path).await;
+                return Err(AppError::Unauthorized(
+                    "Secret access denied".into(),
+                ));
+            }
             if let Some(val) = open_secret_value(&state, &s) {
                 env_vars.insert(env_var.clone(), val);
             }
         }
     }
 
-    audit::write(
+    audit::write_with_context(
         &state,
         None,
         Some(&project_name),
         "get_secrets",
         Some(&project_name),
         "success",
+        &caller,
     )
     .await;
 
     Ok(Json(SecretsResponse { env_vars }))
+}
+
+/// Honey-tokens are decoy secrets that should never be retrieved by a
+/// legitimate caller. Reading one is a 100% attack signal: we revoke the
+/// project's token immediately and write a high-priority alarm to the audit
+/// log. The response to the caller is a generic 401 so they cannot tell
+/// whether the secret exists or is a decoy.
+async fn trigger_honey_token_alarm(state: &AppState, project_name: &str, key_path: &str) {
+    let _ = sqlx::query(
+        "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
+    )
+    .bind(project_name)
+    .execute(&state.pool)
+    .await;
+
+    audit::write(
+        state,
+        None,
+        Some(project_name),
+        "honey_token_access",
+        Some(key_path),
+        "alarm",
+    )
+    .await;
+
+    tracing::warn!(
+        project = %project_name,
+        key_path = %key_path,
+        "ALARM: honey-token accessed; project token revoked"
+    );
 }
 
 async fn get_config(
@@ -380,6 +471,7 @@ async fn get_config(
     Path((project_name, app_name)): Path<(String, String)>,
 ) -> Result<String, AppError> {
     let token = extract_bearer_token(&headers)?;
+    let caller = extract_caller_context(&headers);
     let project = get_project_by_token(&state, &project_name, &token).await?;
 
     let template_secret = sqlx::query_as::<_, crate::models::secret::Secret>(
@@ -399,8 +491,14 @@ async fn get_config(
     })?;
 
     let mappings = project.get_env_mappings();
+    let scope = project.get_scope();
+    let scope_set: std::collections::HashSet<&str> =
+        scope.iter().map(|s| s.as_str()).collect();
     let mut context: HashMap<String, String> = HashMap::new();
     for secret_path in mappings.values() {
+        if !scope_set.is_empty() && !scope_set.contains(secret_path.as_str()) {
+            continue;
+        }
         let secret = sqlx::query_as::<_, crate::models::secret::Secret>(
             &format!(
                 "{} WHERE key_path = ? AND secret_type = 'KEY_VALUE' AND namespace = ?",
@@ -413,6 +511,10 @@ async fn get_config(
         .await?;
 
         if let Some(s) = secret {
+            if s.is_honey() {
+                trigger_honey_token_alarm(&state, &project_name, &s.key_path).await;
+                return Err(AppError::Unauthorized("Secret access denied".into()));
+            }
             if let Some(val) = open_secret_value(&state, &s) {
                 let normalized = secret_path.replace('/', "_");
                 context.insert(secret_path.clone(), val.clone());
@@ -426,13 +528,14 @@ async fn get_config(
         .render_template(&template_content, &context)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Template render failed: {}", e)))?;
 
-    audit::write(
+    audit::write_with_context(
         &state,
         None,
         Some(&project_name),
         "get_config",
         Some(&app_name),
         "success",
+        &caller,
     )
     .await;
 

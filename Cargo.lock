@@ -434,6 +434,7 @@ dependencies = [
  "dotenvy",
  "handlebars",
  "hex",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
