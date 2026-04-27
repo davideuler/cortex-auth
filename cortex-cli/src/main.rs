@@ -500,15 +500,18 @@ fn default_priv_key_path(agent_id: &str) -> PathBuf {
 
 fn write_priv_key_file(path: &std::path::Path, priv_b64: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path)
-        .with_context(|| format!("Failed to create {}", path.display()))?;
-    f.write_all(priv_b64.as_bytes())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let mut f = options.open(path)
+        .with_context(|| format!("Failed to create {}", path.display()))?;
+    f.write_all(priv_b64.as_bytes())?;
     Ok(())
+
 }
 
 fn daemon_session_path() -> PathBuf {
