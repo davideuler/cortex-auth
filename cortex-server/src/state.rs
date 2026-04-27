@@ -24,10 +24,21 @@ pub struct AppState {
     /// Server's Ed25519 signing keypair — used to mint signed project tokens
     /// (#14) and to advertise the public key via /.well-known/jwks.json.
     pub server_keypair: Arc<ServerKeypair>,
+    /// SHA-256 hex digest of the bootstrap admin token. The plaintext is
+    /// generated and printed only on first boot; subsequent verification of
+    /// the `X-Admin-Token` header is done by hashing the supplied value and
+    /// comparing in constant time against this digest.
+    pub admin_token_hash: Arc<String>,
 }
 
 impl AppState {
-    pub fn new(pool: DbPool, config: AppConfig, kek: Kek, server_keypair: ServerKeypair) -> Self {
+    pub fn new(
+        pool: DbPool,
+        config: AppConfig,
+        kek: Kek,
+        server_keypair: ServerKeypair,
+        admin_token_hash: String,
+    ) -> Self {
         let audit_mac_key = crypto::derive_audit_mac_key(&kek);
         Self {
             pool,
@@ -36,6 +47,7 @@ impl AppState {
             audit_mac_key: Arc::new(audit_mac_key),
             audit_mutex: Arc::new(tokio::sync::Mutex::new(())),
             server_keypair: Arc::new(server_keypair),
+            admin_token_hash: Arc::new(admin_token_hash),
         }
     }
 }
