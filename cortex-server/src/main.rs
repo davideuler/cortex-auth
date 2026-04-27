@@ -3,7 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use cortex_server::{build_router, config::AppConfig, config::read_kek_password, db, kek, state::AppState};
+use cortex_server::{
+    build_router,
+    config::{
+        read_kek_password, read_shamir_shares, recovery_mode_requested, recovery_threshold,
+        AppConfig,
+    },
+    db, ed25519_keys, kek,
+    notifications::{self, NotificationEvent},
+    state::AppState,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,14 +34,27 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::create_pool(&config.database_url).await?;
     db::run_migrations(&pool).await?;
 
-    tracing::info!("cortex-server SEALED — awaiting KEK operator password");
-    let password = read_kek_password()?;
-    let unsealed = kek::unseal(&pool, &password).await?;
-    drop(password); // hand off; original String left scope, KEK lives in `unsealed`.
+    let unsealed = if recovery_mode_requested() {
+        tracing::warn!(
+            "cortex-server SEALED (RECOVERY MODE) — awaiting Shamir shares on stdin"
+        );
+        let threshold = recovery_threshold()?;
+        let shares = read_shamir_shares(threshold)?;
+        kek::unseal_via_recovery(&pool, threshold, &shares).await?
+    } else {
+        tracing::info!("cortex-server SEALED — awaiting KEK operator password");
+        let password = read_kek_password()?;
+        let u = kek::unseal(&pool, &password).await?;
+        drop(password);
+        u
+    };
     tracing::info!(
-        "cortex-server UNSEALED (kek_version={})",
-        unsealed.kek_version
+        "cortex-server UNSEALED (kek_version={}, recovery_mode={})",
+        unsealed.kek_version,
+        unsealed.recovery_mode,
     );
+
+    let server_keypair = ed25519_keys::load_or_init(&pool, &unsealed.kek).await?;
 
     // Daily cleanup: remove audit logs older than 60 days
     let cleanup_pool = pool.clone();
@@ -52,7 +74,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let state = AppState::new(pool, config.clone(), unsealed.kek);
+    let recovery_mode = unsealed.recovery_mode;
+    let state = AppState::new(pool, config.clone(), unsealed.kek, server_keypair);
+
+    if recovery_mode {
+        cortex_server::audit::write(&state, None, None, "recovery_boot", None, "alarm").await;
+        notifications::dispatch(
+            &state,
+            NotificationEvent::RecoveryBoot {
+                hostname: std::env::var("HOSTNAME").ok(),
+            },
+        );
+    }
+
     let app = build_router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
 

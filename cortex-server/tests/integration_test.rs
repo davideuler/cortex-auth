@@ -6,14 +6,15 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use cortex_server::{build_router, config::AppConfig, db, kek, state::AppState};
+use cortex_server::{build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState};
 
 async fn setup_test_app() -> axum::Router {
     let config = AppConfig::test_config();
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
-    let state = AppState::new(pool, config, unsealed.kek);
+    let server_keypair = ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
+    let state = AppState::new(pool, config, unsealed.kek, server_keypair);
     build_router(state)
 }
 
@@ -1029,7 +1030,7 @@ async fn test_admin_projects_list_includes_token_status() {
 
 #[tokio::test]
 async fn test_expired_token_returns_token_expired_error_code() {
-    use cortex_server::{build_router, config::AppConfig, db, kek, state::AppState};
+    use cortex_server::{build_router, config::AppConfig, db, ed25519_keys, kek, state::AppState};
 
     // Build app on a pool we keep a handle to, so we can backdate the token
     // expiry directly in SQL to simulate the 120-minute boundary elapsing.
@@ -1037,7 +1038,8 @@ async fn test_expired_token_returns_token_expired_error_code() {
     let pool = db::create_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let unsealed = kek::unseal(&pool, "test-operator-password").await.unwrap();
-    let state = AppState::new(pool.clone(), config, unsealed.kek);
+    let kp = ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
+    let state = AppState::new(pool.clone(), config, unsealed.kek, kp);
     let app = build_router(state);
 
     // Seed an agent + secret + project via the admin/discover endpoints.
@@ -1172,7 +1174,8 @@ async fn test_envelope_each_secret_has_unique_wrapped_dek() {
     let unsealed = cortex_server::kek::unseal(&pool, "test-operator-password")
         .await
         .unwrap();
-    let app = build_router(AppState::new(pool.clone(), config, unsealed.kek));
+    let kp = cortex_server::ed25519_keys::load_or_init(&pool, &unsealed.kek).await.unwrap();
+    let app = build_router(AppState::new(pool.clone(), config, unsealed.kek, kp));
 
     for (path, val) in [("a_key", "value-a"), ("b_key", "value-b")] {
         let req = Request::builder()
@@ -1444,4 +1447,359 @@ async fn test_creating_secret_in_new_namespace_auto_registers_it() {
     let resp = app.oneshot(req).await.unwrap();
     let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
     assert!(list.iter().any(|n| n["name"] == "auto-ns"));
+}
+
+// ─── Ed25519 agent identity + signed project tokens (#13 / #14) ──────────
+
+#[tokio::test]
+async fn test_jwks_endpoint_exposes_server_pubkey() {
+    let app = setup_test_app().await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/.well-known/jwks.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let keys = body["keys"].as_array().expect("keys must be an array");
+    assert!(!keys.is_empty(), "JWKS should contain at least one key after first boot");
+    assert_eq!(keys[0]["kty"], "OKP");
+    assert_eq!(keys[0]["crv"], "Ed25519");
+    assert_eq!(keys[0]["alg"], "EdDSA");
+    assert!(keys[0]["kid"].as_str().is_some());
+    assert!(keys[0]["x"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn test_ed25519_agent_discover_succeeds_with_valid_signature() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
+
+    let app = setup_test_app().await;
+
+    // Generate a fresh keypair for the test agent.
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 = B64.encode(signing.verifying_key().to_bytes());
+
+    // Register the agent with agent_pub (no jwt_secret).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/agents")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"agent_id": "ed-agent", "agent_pub": pub_b64}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Seed a secret so the discover scope is non-empty.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/secrets")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"key_path": "openai_api_key", "secret_type": "KEY_VALUE", "value": "sk-x"})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Sign auth_proof and discover with signed_token=true.
+    let ts = chrono::Utc::now().timestamp();
+    let nonce = "test-nonce-1";
+    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, "ed-agent");
+    let sig = signing.sign(message.as_bytes());
+    let auth_proof = B64.encode(sig.to_bytes());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "ed-agent",
+                "auth_proof": auth_proof,
+                "ts": ts,
+                "nonce": nonce,
+                "signed_token": true,
+                "context": {
+                    "project_name": "ed-proj",
+                    "file_content": "OPENAI_API_KEY=",
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert!(body["project_token"].as_str().is_some());
+    let signed = body["signed_project_token"]
+        .as_str()
+        .expect("signed_project_token must be present when signed_token=true");
+    assert_eq!(signed.matches('.').count(), 2, "signed token must be a 3-part JWT");
+
+    // The signed JWT should verify against /project/secrets just like the random one.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/project/secrets/ed-proj")
+        .header("authorization", format!("Bearer {}", signed))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_ed25519_discover_rejects_skewed_timestamp() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand_core::OsRng;
+
+    let app = setup_test_app().await;
+    let signing = SigningKey::generate(&mut OsRng);
+    let pub_b64 = B64.encode(signing.verifying_key().to_bytes());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/agents")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"agent_id": "ed-agent-skew", "agent_pub": pub_b64}).to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    // 1 hour in the past — outside the ±5-minute window.
+    let ts = chrono::Utc::now().timestamp() - 3600;
+    let nonce = "old";
+    let message = format!("{}|{}|{}|/agent/discover", ts, nonce, "ed-agent-skew");
+    let sig = signing.sign(message.as_bytes());
+    let auth_proof = B64.encode(sig.to_bytes());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/discover")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "agent_id": "ed-agent-skew",
+                "auth_proof": auth_proof,
+                "ts": ts,
+                "nonce": nonce,
+                "context": {"project_name": "p", "file_content": ""}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─── Notification channels (#12) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_notification_channel_crud() {
+    let app = setup_test_app().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/notification-channels")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({
+                "name": "test-slack",
+                "channel_type": "slack",
+                "config": {"webhook_url": "https://hooks.slack.com/services/T/B/abc"},
+                "description": "test"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = body_json(resp.into_body()).await;
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/notification-channels")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let list: Vec<Value> = serde_json::from_value(body_json(resp.into_body()).await).unwrap();
+    assert!(list.iter().any(|c| c["id"] == id && c["channel_type"] == "slack"));
+    // The list response must NOT leak the webhook URL.
+    let raw = serde_json::to_string(&list).unwrap();
+    assert!(!raw.contains("hooks.slack.com"));
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/admin/notification-channels/{}", id))
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(json!({"enabled": false}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/admin/notification-channels/{}", id))
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_notification_channel_invalid_type_rejected() {
+    let app = setup_test_app().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/notification-channels")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({
+                "name": "bad",
+                "channel_type": "carrier-pigeon",
+                "config": {}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─── Shamir m-of-n (#15) ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_shamir_share_generation_and_recovery_roundtrip() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let pool = cortex_server::db::create_pool("sqlite::memory:").await.unwrap();
+    cortex_server::db::run_migrations(&pool).await.unwrap();
+    let unsealed = cortex_server::kek::unseal(&pool, "test-operator-password")
+        .await
+        .unwrap();
+    let kek_bytes = *unsealed.kek.as_bytes();
+    let _kp = cortex_server::ed25519_keys::load_or_init(&pool, &unsealed.kek)
+        .await
+        .unwrap();
+
+    // Split the KEK directly via the shamir module.
+    let shares = cortex_server::shamir::split(&kek_bytes, 3, 5).unwrap();
+    assert_eq!(shares.len(), 5);
+
+    // Recover with three shares, drop the unsealed handle so we can re-unseal.
+    let recovered = cortex_server::shamir::recover(3, &shares[..3]).unwrap();
+    assert_eq!(recovered.len(), 32);
+    assert_eq!(recovered, kek_bytes.to_vec());
+
+    // Recovery boot should accept the same shares and produce a usable KEK.
+    drop(unsealed);
+    let recovered_unseal = cortex_server::kek::unseal_via_recovery(&pool, 3, &shares[..3])
+        .await
+        .unwrap();
+    assert!(recovered_unseal.recovery_mode);
+    assert_eq!(*recovered_unseal.kek.as_bytes(), kek_bytes);
+
+    // Wrong shares (re-encoded) should fail the sentinel check.
+    let mut bad_shares = shares[..3].to_vec();
+    let last = bad_shares.last_mut().unwrap();
+    let mut bytes = B64.decode(last.as_str()).unwrap();
+    let idx = bytes.len() - 1;
+    bytes[idx] ^= 0xff;
+    *last = B64.encode(&bytes);
+    let res = cortex_server::kek::unseal_via_recovery(&pool, 3, &bad_shares).await;
+    assert!(res.is_err());
+}
+
+// ─── Device authorization (#16) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn test_device_authorize_flow() {
+    let app = setup_test_app().await;
+
+    // Pre-register the agent so approval can bind to it.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/agents")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"agent_id": "device-agent", "jwt_secret": "x"}).to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    // Step 1: device requests authorization.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/device/authorize")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"client_id": "test"}).to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+
+    // Step 2: polling before approval returns 401 with code=authorization_pending.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/device/token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["error_code"], "authorization_pending");
+
+    // Step 3: admin approves.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/admin/web/device/approve")
+        .header("content-type", "application/json")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::from(
+            json!({"user_code": user_code, "agent_id": "device-agent"}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Step 4: polling now returns an EdDSA access token.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/device/token")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"device_code": device_code, "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+                .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let token = body["access_token"].as_str().unwrap();
+    assert_eq!(token.matches('.').count(), 2, "access token must be a JWT");
+    assert_eq!(body["token_type"], "Bearer");
 }

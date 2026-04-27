@@ -51,9 +51,10 @@
 ## Agent 密钥管理原则
 
 - **Agent 不接触密钥明文** — 密钥由 `cortex-server` 直接通过 `exec()` 注入进程环境，Agent 代码本身从不读取或存储密钥值
-- **无需人工介入** — Agent 自主完成跨项目、跨任务的密钥获取与注入，每次运行无需人工手动输入凭证
+- **无需人工介入** — Agent 自主完成跨项目、跨任务的密钥获取与注入，每次运行无需人工手动输入凭证（首次项目密钥访问审批除外）
 - **全自动密钥注入** — 无人值守的 Agent 流水线在运行时按需获取所需密钥，无需操作人员介入
 - **密钥不落盘** — API Key、数据库密码、Auth Token、密码等凭证仅以环境变量形式存在于进程内存中，不写入任何文件
+- **同 UID AI Agent 隔离** — `cortex-daemon`（#16）在独立进程中持有 Agent 的 Ed25519 私钥并通过 Unix socket（`~/.cortex/agent.sock`）暴露 `run`/`inject_template` 操作，同机进程可请求执行已知二进制但无法导出密钥原文
 
 ## 安装
 
@@ -275,13 +276,87 @@ curl -X POST http://localhost:3000/admin/secrets \
 
 `default` namespace 自动创建且不可删除；仍有密钥/Agent/项目引用的 namespace 拒绝删除。
 
+### 蜜罐告警与外发通知（#12 / #15）
+
+蜜罐密钥被读取时立即吊销调用方令牌、写入 `alarm` 审计行，并向所有启用的通知渠道
+派发外发告警。同样地，使用 Shamir 分片恢复模式启动服务时也会派发告警。
+通道在管理后台 `Notifications` 页签中管理；支持类型：
+
+| 通道 | 传输方式 | 配置 |
+|------|----------|------|
+| Slack    | 入站 webhook | `{"webhook_url":"https://hooks.slack.com/..."}` |
+| Discord  | 入站 webhook | `{"webhook_url":"https://discord.com/api/webhooks/..."}` |
+| Telegram | Bot API | `{"bot_token":"...","chat_id":"..."}` |
+| Email    | `himalaya-cli`（在 PATH 中可用时） | `{"to":"oncall@example.com","account":"..."}` |
+
+通道配置本身使用 KEK 信封加密；只盗取数据库不会泄露 webhook URL 或 bot token。
+
+### Ed25519 Agent 身份（#13）
+
+Agent 现在可以注册 **Ed25519 公钥** 替代（或并行于）传统的 HMAC `jwt_secret`。
+Agent 在本地用 `cortex-cli gen-key` 生成密钥对，仅上传公钥，并在 `/agent/discover`
+时对 `ts | nonce | agent_id | /agent/discover` 进行 Ed25519 签名作为 `auth_proof`。
+请求 `ts` 必须在服务器时钟 ±5 分钟内（防重放）。
+
+```bash
+# 1. 本地生成密钥对（私钥落盘 ~/.cortex/agent-<id>.key，权限 0600）
+cortex-cli gen-key --agent-id my-agent
+
+# 2. 上传公钥注册 Agent
+curl -X POST http://localhost:3000/admin/agents \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"agent_id":"my-agent","agent_pub":"<base64url-pubkey>"}'
+
+# 3. 运行时签名
+cortex-cli sign-proof --agent-id my-agent --priv-key-file ~/.cortex/agent-my-agent.key
+```
+
+### Ed25519 签名项目令牌（#14）
+
+`POST /agent/discover` 接受 `signed_token: true`，响应中除了传统随机 `project_token`
+还会返回 EdDSA 签名的 JWT 形式 `signed_project_token`。验证方从
+`GET /.well-known/jwks.json` 获取服务器公钥（按 `kid` 索引，便于密钥轮转后老 token
+继续可验证）；吊销由 `revoked_token_jti` 表承担。
+
+### Shamir m-of-n 解封恢复（#15）
+
+操作员密码丢失时，可用 Shamir 分片重建 KEK：
+
+```bash
+# 一次性生成分片（服务器不保留副本，请立刻分发给操作员）
+curl -X POST http://localhost:3000/admin/shamir/generate \
+  -H "Content-Type: application/json" -H "X-Admin-Token: $ADMIN_TOKEN" \
+  -d '{"threshold": 3, "shares": 5}'
+
+# 恢复模式启动：交互式从 stdin 读取 m 份分片
+CORTEX_RECOVERY_MODE=1 CORTEX_RECOVERY_THRESHOLD=3 \
+ADMIN_TOKEN=$ADMIN_TOKEN \
+cortex-server
+```
+
+恢复成功后会写入 `alarm` 状态的 `recovery_boot` 审计行并触发外发通知。
+
+### 设备授权与 cortex-daemon（#16）
+
+长期运行的 `cortex-daemon` 可在 Unix Socket（`~/.cortex/agent.sock`，权限 0600）
+代为持有 Ed25519 会话密钥，调用方通过 socket 请求 `run` 即可注入密钥并执行进程，
+原始密钥永远不会回传。登录使用 OAuth 2.0 设备授权（RFC 8628）：
+
+```bash
+cortex-daemon &
+cortex-cli daemon login --url http://localhost:3000   # 打印 user_code
+# 管理员在 /device 页面或 Devices 页签批准 user_code，绑定到注册过的 agent_id
+cortex-cli daemon status
+```
+
 ### 其他保障
 
 - AES-256-GCM 全程使用唯一随机 nonce，DEK→密文 与 KEK→DEK 两层均独立 nonce
-- 项目令牌仅以 SHA-256 哈希形式存储，原始 token 不入库
-- 管理员操作通过静态 `ADMIN_TOKEN` 保护
-- `/agent/discover` 直接通过签名 JWT 验证 Agent 身份，无独立 Session 令牌
-- 项目访问使用一次性签发的 `project_token`（必须保存，无法找回，仅可重新生成）
-- 全量审计日志，记录所有密钥访问行为
+- 项目令牌：legacy 路径用 SHA-256 哈希存储；signed_token 路径使用 EdDSA JWT，公钥经 JWKS 暴露
+- 管理员操作通过静态 `ADMIN_TOKEN` 保护（多用户 RBAC 列入 #18）
+- `/agent/discover` 支持 Ed25519（优先）或 HMAC-SHA256 JWT 验证 Agent 身份
+- 全量审计日志且 HMAC-SHA256 链式防篡改
 - `cortex-cli` 使用 `exec()` 启动子进程——父进程无法访问密钥
-- KEK 轮转：`POST /admin/rotate-key {"new_kek_password": "..."}` 仅重新包裹所有 DEK 并升级 `kek_version`，密文本身保持不变
+- `cortex-daemon` 通过 Unix socket 屏蔽密钥导出
+- KEK 轮转：`POST /admin/rotate-key`；KEK 恢复：Shamir 分片
+- 外发告警支持 Slack / Discord / Telegram / 邮件（himalaya-cli）

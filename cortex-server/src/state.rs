@@ -1,6 +1,11 @@
 use std::sync::Arc;
 
-use crate::{config::AppConfig, crypto::{self, Kek}, db::DbPool};
+use crate::{
+    config::AppConfig,
+    crypto::{self, Kek},
+    db::DbPool,
+    ed25519_keys::ServerKeypair,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,10 +21,13 @@ pub struct AppState {
     /// Serializes audit log appends so concurrent writers see a consistent
     /// `prev_mac` and the chain stays linear.
     pub audit_mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Server's Ed25519 signing keypair — used to mint signed project tokens
+    /// (#14) and to advertise the public key via /.well-known/jwks.json.
+    pub server_keypair: Arc<ServerKeypair>,
 }
 
 impl AppState {
-    pub fn new(pool: DbPool, config: AppConfig, kek: Kek) -> Self {
+    pub fn new(pool: DbPool, config: AppConfig, kek: Kek, server_keypair: ServerKeypair) -> Self {
         let audit_mac_key = crypto::derive_audit_mac_key(&kek);
         Self {
             pool,
@@ -27,6 +35,7 @@ impl AppState {
             kek: Arc::new(kek),
             audit_mac_key: Arc::new(audit_mac_key),
             audit_mutex: Arc::new(tokio::sync::Mutex::new(())),
+            server_keypair: Arc::new(server_keypair),
         }
     }
 }

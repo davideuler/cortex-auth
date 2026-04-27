@@ -38,7 +38,7 @@ pub fn project_router() -> Router<AppState> {
 const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at FROM projects";
 const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT_FULL: &str =
-    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at FROM agents";
+    "SELECT id, agent_id, jwt_secret_encrypted, wrapped_dek, kek_version, description, namespace, created_at, agent_pub FROM agents";
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
     headers
@@ -150,28 +150,51 @@ async fn discover(
     .await?
     .ok_or_else(|| AppError::Unauthorized("Unknown agent_id".into()))?;
 
-    let wrapped = agent
-        .wrapped_dek
-        .as_deref()
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
-    let jwt_secret = crypto::open_envelope(&agent.jwt_secret_encrypted, wrapped, &state.kek)
-        .map_err(AppError::Internal)?;
+    if let Some(pub_b64) = &agent.agent_pub {
+        // (#13) Ed25519 path. Message is `ts|nonce|agent_id|/agent/discover`
+        // — each field separated by '|'. Replay protection is by the 5-minute
+        // ts window; nonce caching is a future hardening (see UNCERTAINTIES).
+        let ts = req.ts.ok_or_else(|| {
+            AppError::Unauthorized("ts required for Ed25519 auth_proof".into())
+        })?;
+        let nonce = req
+            .nonce
+            .as_deref()
+            .ok_or_else(|| AppError::Unauthorized("nonce required for Ed25519 auth_proof".into()))?;
+        let now = Utc::now().timestamp();
+        if (now - ts).abs() > 300 {
+            return Err(AppError::Unauthorized(
+                "auth_proof ts is more than 5 minutes from server clock".into(),
+            ));
+        }
+        let message = format!("{}|{}|{}|/agent/discover", ts, nonce, req.agent_id);
+        crate::ed25519_keys::verify_agent_signature(pub_b64, message.as_bytes(), &req.auth_proof)
+            .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
+    } else {
+        // Legacy HMAC-SHA256 JWT path.
+        let wrapped = agent
+            .wrapped_dek
+            .as_deref()
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("agent missing wrapped_dek")))?;
+        let jwt_secret = crypto::open_envelope(&agent.jwt_secret_encrypted, wrapped, &state.kek)
+            .map_err(AppError::Internal)?;
 
-    let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false;
-    validation.required_spec_claims.clear();
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = false;
+        validation.required_spec_claims.clear();
 
-    let token_data = decode::<AgentClaims>(
-        &req.auth_proof,
-        &DecodingKey::from_secret(jwt_secret.as_bytes()),
-        &validation,
-    )
-    .map_err(|_| AppError::Unauthorized("Invalid auth_proof JWT".into()))?;
+        let token_data = decode::<AgentClaims>(
+            &req.auth_proof,
+            &DecodingKey::from_secret(jwt_secret.as_bytes()),
+            &validation,
+        )
+        .map_err(|_| AppError::Unauthorized("Invalid auth_proof JWT".into()))?;
 
-    if token_data.claims.sub != req.agent_id {
-        return Err(AppError::Unauthorized(
-            "JWT subject does not match agent_id".into(),
-        ));
+        if token_data.claims.sub != req.agent_id {
+            return Err(AppError::Unauthorized(
+                "JWT subject does not match agent_id".into(),
+            ));
+        }
     }
 
     let agent_id = agent.agent_id.clone();
@@ -317,6 +340,26 @@ async fn discover(
     )
     .await;
 
+    let signed_project_token = if req.signed_token {
+        let claims = serde_json::json!({
+            "iss": "cortex-auth",
+            "sub": project_name,
+            "aud": "cortex-cli",
+            "iat": Utc::now().timestamp(),
+            "exp": expires_at.timestamp(),
+            "jti": Uuid::new_v4().to_string(),
+            "scope": scope_paths,
+            "namespace": namespace,
+            "project_id": project_name,
+        });
+        Some(
+            crate::ed25519_keys::sign_jwt(&state.server_keypair, &claims)
+                .map_err(AppError::Internal)?,
+        )
+    } else {
+        None
+    };
+
     Ok(Json(DiscoverResponse {
         mapped_keys,
         full_matched,
@@ -326,6 +369,7 @@ async fn discover(
         unmatched_keys: unmatched,
         namespace,
         scope: scope_paths,
+        signed_project_token,
     }))
 }
 
@@ -342,7 +386,41 @@ async fn get_project_by_token(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", project_name)))?;
 
-    if !crypto::verify_token(token, &project.project_token_hash) {
+    // (#14) Tokens with three dot-separated segments are EdDSA JWTs minted
+    // by /agent/discover when the caller passed `signed_token: true`. Legacy
+    // hex-encoded random tokens go through the SHA-256 hash compare path.
+    let token_ok = if token.matches('.').count() == 2 {
+        match crate::ed25519_keys::verify_jwt::<serde_json::Value>(&state.server_keypair, token) {
+            Ok(claims) => {
+                // Check exp + jti revocation.
+                let exp = claims.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
+                if exp != 0 && exp < Utc::now().timestamp() {
+                    return Err(AppError::token_expired());
+                }
+                let sub = claims.get("sub").and_then(|v| v.as_str()).unwrap_or("");
+                if sub != project_name {
+                    return Err(AppError::Unauthorized("token sub != project".into()));
+                }
+                if let Some(jti) = claims.get("jti").and_then(|v| v.as_str()) {
+                    let revoked: Option<(String,)> = sqlx::query_as(
+                        "SELECT jti FROM revoked_token_jti WHERE jti = ?",
+                    )
+                    .bind(jti)
+                    .fetch_optional(&state.pool)
+                    .await?;
+                    if revoked.is_some() {
+                        return Err(AppError::token_revoked());
+                    }
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        crypto::verify_token(token, &project.project_token_hash)
+    };
+
+    if !token_ok {
         return Err(AppError::Unauthorized("Invalid project token".into()));
     }
 
@@ -410,7 +488,13 @@ async fn get_secrets(
 
         if let Some(s) = secret {
             if s.is_honey() {
-                trigger_honey_token_alarm(&state, &project_name, &s.key_path).await;
+                trigger_honey_token_alarm(
+                    &state,
+                    &project_name,
+                    &s.key_path,
+                    caller.source_ip.clone(),
+                )
+                .await;
                 return Err(AppError::Unauthorized(
                     "Secret access denied".into(),
                 ));
@@ -437,10 +521,17 @@ async fn get_secrets(
 
 /// Honey-tokens are decoy secrets that should never be retrieved by a
 /// legitimate caller. Reading one is a 100% attack signal: we revoke the
-/// project's token immediately and write a high-priority alarm to the audit
-/// log. The response to the caller is a generic 401 so they cannot tell
-/// whether the secret exists or is a decoy.
-async fn trigger_honey_token_alarm(state: &AppState, project_name: &str, key_path: &str) {
+/// project's token immediately, write a high-priority alarm to the audit
+/// log, and dispatch outbound notifications to every configured channel
+/// (email via himalaya-cli, Slack/Telegram/Discord webhooks). The response
+/// to the caller is a generic 401 so they cannot tell whether the secret
+/// exists or is a decoy.
+async fn trigger_honey_token_alarm(
+    state: &AppState,
+    project_name: &str,
+    key_path: &str,
+    source_ip: Option<String>,
+) {
     let _ = sqlx::query(
         "UPDATE projects SET token_revoked_at = datetime('now'), updated_at = datetime('now') WHERE project_name = ? AND token_revoked_at IS NULL",
     )
@@ -462,6 +553,15 @@ async fn trigger_honey_token_alarm(state: &AppState, project_name: &str, key_pat
         project = %project_name,
         key_path = %key_path,
         "ALARM: honey-token accessed; project token revoked"
+    );
+
+    crate::notifications::dispatch(
+        state,
+        crate::notifications::NotificationEvent::HoneyTokenAccess {
+            project_name: project_name.to_string(),
+            key_path: key_path.to_string(),
+            source_ip,
+        },
     );
 }
 
@@ -512,7 +612,13 @@ async fn get_config(
 
         if let Some(s) = secret {
             if s.is_honey() {
-                trigger_honey_token_alarm(&state, &project_name, &s.key_path).await;
+                trigger_honey_token_alarm(
+                    &state,
+                    &project_name,
+                    &s.key_path,
+                    caller.source_ip.clone(),
+                )
+                .await;
                 return Err(AppError::Unauthorized("Secret access denied".into()));
             }
             if let Some(val) = open_secret_value(&state, &s) {
@@ -540,4 +646,173 @@ async fn get_config(
     .await;
 
     Ok(rendered)
+}
+
+// ─── #14: JWKS endpoint ──────────────────────────────────────────────────
+
+/// `GET /.well-known/jwks.json` exposes every server public key by `kid` so
+/// downstream services can verify EdDSA-signed project tokens (#14) across
+/// key rotations.
+pub async fn jwks(
+    State(state): State<AppState>,
+) -> Result<Json<crate::ed25519_keys::JwkSet>, AppError> {
+    let set = crate::ed25519_keys::list_jwks(&state.pool, &state.kek)
+        .await
+        .map_err(AppError::Internal)?;
+    Ok(Json(set))
+}
+
+// ─── #16: Device Authorization Grant (RFC 8628) ─────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct DeviceAuthorizeRequest {
+    /// Optional client identifier — useful for the dashboard's pending-device
+    /// list. Free-form; not authenticated at this stage.
+    pub client_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DeviceAuthorizeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: i64,
+    interval: i64,
+}
+
+pub async fn device_authorize(
+    State(state): State<AppState>,
+    Json(_req): Json<DeviceAuthorizeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let device_code = crypto::generate_token();
+    let user_code = generate_user_code();
+    let id = Uuid::new_v4().to_string();
+    let expires = Utc::now() + Duration::minutes(10);
+    let expires_str = format_sqlite_timestamp(expires);
+
+    sqlx::query(
+        "INSERT INTO pending_devices (id, device_code, user_code, status, expires_at) \
+         VALUES (?, ?, ?, 'pending', ?)",
+    )
+    .bind(&id)
+    .bind(&device_code)
+    .bind(&user_code)
+    .bind(&expires_str)
+    .execute(&state.pool)
+    .await?;
+
+    let resp = DeviceAuthorizeResponse {
+        device_code,
+        user_code: user_code.clone(),
+        verification_uri: "/device".to_string(),
+        expires_in: 600,
+        interval: 5,
+    };
+
+    audit::write(&state, None, None, "device_authorize", Some(&user_code), "success").await;
+    Ok(Json(serde_json::to_value(resp).unwrap()))
+}
+
+#[derive(serde::Deserialize)]
+pub struct DeviceTokenRequest {
+    pub device_code: String,
+    pub grant_type: Option<String>,
+}
+
+pub async fn device_token(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceTokenRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT status, agent_id, expires_at FROM pending_devices WHERE device_code = ?",
+    )
+    .bind(&req.device_code)
+    .fetch_optional(&state.pool)
+    .await?;
+    let (status, agent_id, expires_at) =
+        row.ok_or_else(|| AppError::Unauthorized("Unknown device_code".into()))?;
+
+    let exp = chrono::NaiveDateTime::parse_from_str(&expires_at, "%Y-%m-%d %H:%M:%S")
+        .map(|n| chrono::DateTime::<Utc>::from_naive_utc_and_offset(n, Utc))
+        .ok();
+    if exp.map(|t| t < Utc::now()).unwrap_or(false) {
+        return Err(AppError::Unauthorized("device_code expired".into()));
+    }
+
+    match status.as_str() {
+        "pending" => Err(AppError::TokenError {
+            code: "authorization_pending",
+            message: "Approval still pending".into(),
+        }),
+        "denied" => Err(AppError::Unauthorized("Approval denied".into())),
+        "approved" => {
+            let agent_id =
+                agent_id.ok_or_else(|| AppError::Internal(anyhow::anyhow!("approved row has no agent_id")))?;
+            let claims = serde_json::json!({
+                "iss": "cortex-auth",
+                "sub": agent_id,
+                "aud": "cortex-daemon",
+                "iat": Utc::now().timestamp(),
+                "exp": (Utc::now() + Duration::days(30)).timestamp(),
+                "jti": Uuid::new_v4().to_string(),
+                "scope": "daemon",
+            });
+            let access_token = crate::ed25519_keys::sign_jwt(&state.server_keypair, &claims)
+                .map_err(AppError::Internal)?;
+
+            audit::write(&state, Some(&agent_id), None, "device_token_issue", None, "success").await;
+
+            Ok(Json(serde_json::json!({
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": 30 * 86400,
+                "kid": state.server_keypair.kid,
+            })))
+        }
+        other => Err(AppError::Unauthorized(format!("status={}", other))),
+    }
+}
+
+pub async fn device_approval_page() -> axum::response::Html<&'static str> {
+    axum::response::Html(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>CortexAuth — approve device</title>
+<style>body{font-family:system-ui;max-width:520px;margin:48px auto;padding:0 16px;color:#1a202c}
+input,button{font-size:14px;padding:8px 12px;width:100%;box-sizing:border-box;margin:6px 0}
+button{background:#4f8ef7;color:#fff;border:none;border-radius:4px;cursor:pointer}
+.note{color:#718096;font-size:13px}</style>
+<h1>Approve a CortexAuth device</h1>
+<p class="note">Paste the user code shown by <code>cortex-cli daemon login</code>, then assign it to an agent.</p>
+<input id="user_code" placeholder="USER-CODE" autocomplete="off">
+<input id="agent_id" placeholder="agent_id (must already be registered)">
+<input id="admin_token" type="password" placeholder="X-Admin-Token (until SSO lands)">
+<button onclick="approve()">Approve</button>
+<pre id="out" class="note"></pre>
+<script>
+async function approve() {
+  const r = await fetch('/admin/web/device/approve', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin-Token': document.getElementById('admin_token').value},
+    body: JSON.stringify({
+      user_code: document.getElementById('user_code').value.trim(),
+      agent_id: document.getElementById('agent_id').value.trim(),
+    })
+  });
+  document.getElementById('out').textContent = await r.text();
+}
+</script>"#,
+    )
+}
+
+fn generate_user_code() -> String {
+    use rand::Rng;
+    const ALPH: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::thread_rng();
+    let mut pick = |n: usize| -> String {
+        (0..n)
+            .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
+            .collect()
+    };
+    format!("{}-{}", pick(4), pick(4))
 }
