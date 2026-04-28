@@ -599,7 +599,7 @@ const App = {
   nav(sec) {
     const titles   = { secrets:'Secrets', agents:'Agents', policies:'Policies', namespaces:'Namespaces', projects:'Projects', audit:'Audit Logs', rotate:'Key Rotation', notifications:'Notifications', devices:'Devices', grants:'Pending Grants', daemons:'Daemon Allowlist', shamir:'Shamir Recovery' };
     const actions  = {
-      secrets:    `<button class="btn btn-primary" onclick="Secrets.openCreate()">+ Add Secret</button><button class="btn btn-secondary" onclick="Secrets.load()">↻</button>`,
+      secrets:    `<button class="btn btn-primary" onclick="Secrets.openCreate()">+ Add Secret</button><button class="btn btn-secondary" onclick="Secrets.openEnvImport()">Import .env</button><button class="btn btn-secondary" onclick="Secrets.load()">↻</button>`,
       agents:     `<button class="btn btn-primary" onclick="Agents.openCreate()">+ Register Agent</button><button class="btn btn-secondary" onclick="Agents.load()">↻</button>`,
       policies:   `<button class="btn btn-primary" onclick="Policies.openCreate()">+ Create Policy</button><button class="btn btn-secondary" onclick="Policies.load()">↻</button>`,
       namespaces: `<button class="btn btn-primary" onclick="Namespaces.openCreate()">+ New Namespace</button><button class="btn btn-secondary" onclick="Namespaces.load()">↻</button>`,
@@ -719,6 +719,152 @@ const Secrets = {
       await API.post('/admin/secrets', { key_path: kp, secret_type: ty, value: val, namespace: ns, description: dc });
       closeModal(); toast(`Secret "${kp}" created`, 'success'); Secrets.load();
     } catch(e) { toast('Error: ' + e.message, 'error'); }
+  },
+
+  openEnvImport() {
+    openModal('Import .env Secrets',
+      `<div class="form-group">
+         <label>.env content *</label>
+         <textarea id="fi-env" style="min-height:220px;font-family:'SF Mono',monospace" placeholder="OPENAI_API_KEY=sk-...\nDATABASE_URL=postgres://..."></textarea>
+         <div class="form-hint">Blank lines and comments are ignored. Each KEY=value line becomes a KEY_VALUE secret.</div>
+       </div>
+       <div class="form-group">
+         <label>Namespace</label>
+         <input id="fi-ns" type="text" placeholder="default">
+       </div>
+       <div class="form-group">
+         <label>Description</label>
+         <input id="fi-dc" type="text" value="Imported from .env">
+       </div>
+       <div class="form-group">
+         <label>Duplicate key paths</label>
+         <select id="fi-dupes"><option value="skip">Skip existing</option><option value="fail">Report as errors</option></select>
+       </div>
+       <div class="form-group">
+         <label style="display:flex;align-items:center;gap:8px;font-weight:400">
+           <input id="fi-lower" type="checkbox" checked style="width:auto"> Normalize key paths to lowercase
+         </label>
+       </div>
+       <input id="fi-file" type="file" accept=".env,text/plain" style="display:none" onchange="Secrets.loadEnvFile(this)">`,
+      `<button class="btn btn-secondary" onclick="document.getElementById('fi-file').click()">Choose File</button>
+       <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+       <button class="btn btn-primary" id="fi-import-btn" onclick="Secrets.importEnv()">Import Secrets</button>`);
+  },
+
+  loadEnvFile(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById('fi-env').value = String(reader.result || ''); };
+    reader.onerror = () => toast('Failed to read file', 'error');
+    reader.readAsText(file);
+  },
+
+  parseEnvContent(content) {
+    const rows = [];
+    const errors = [];
+    content.split(/\r?\n/).forEach((raw, i) => {
+      let line = raw.trim();
+      const lineNo = i + 1;
+      if (!line || line.startsWith('#')) return;
+      if (line.startsWith('export ')) line = line.slice(7).trimStart();
+      const eq = line.indexOf('=');
+      if (eq < 1) { errors.push(`Line ${lineNo}: missing "="`); return; }
+      const key = line.slice(0, eq).trim();
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        errors.push(`Line ${lineNo}: invalid env key "${key}"`);
+        return;
+      }
+      let value = line.slice(eq + 1).trim();
+      value = Secrets.stripEnvComment(value);
+      value = Secrets.unquoteEnvValue(value);
+      if (!value) { errors.push(`Line ${lineNo}: empty value for "${key}"`); return; }
+      rows.push({ key, value, lineNo });
+    });
+    return { rows, errors };
+  },
+
+  stripEnvComment(value) {
+    let quote = null;
+    let escaped = false;
+    for (let i = 0; i < value.length; i++) {
+      const ch = value[i];
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (quote) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === '#' && (i === 0 || /\s/.test(value[i - 1]))) return value.slice(0, i).trimEnd();
+    }
+    return value;
+  },
+
+  unquoteEnvValue(value) {
+    if (value.length >= 2 && value[0] === '"' && value[value.length - 1] === '"') {
+      return value.slice(1, -1)
+        .replace(/\\n/g, '\n')
+        .replace(/\\r/g, '\r')
+        .replace(/\\t/g, '\t')
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, '\\');
+    }
+    if (value.length >= 2 && value[0] === "'" && value[value.length - 1] === "'") {
+      return value.slice(1, -1).replace(/\\'/g, "'");
+    }
+    return value;
+  },
+
+  async importEnv() {
+    const content = document.getElementById('fi-env').value;
+    const ns = document.getElementById('fi-ns').value.trim() || undefined;
+    const desc = document.getElementById('fi-dc').value.trim() || undefined;
+    const skipDupes = document.getElementById('fi-dupes').value === 'skip';
+    const lower = document.getElementById('fi-lower').checked;
+    const parsed = Secrets.parseEnvContent(content);
+    if (!parsed.rows.length) {
+      toast(parsed.errors.length ? parsed.errors.slice(0, 3).join('; ') : 'No importable KEY=value lines found', 'error');
+      return;
+    }
+    const existing = new Set((S.secrets || []).map(s => `${s.namespace || 'default'}\u0000${s.key_path}`));
+    const namespace = ns || 'default';
+    const button = document.getElementById('fi-import-btn');
+    button.disabled = true;
+    button.textContent = 'Importing...';
+    let created = 0;
+    let skipped = 0;
+    const errors = [...parsed.errors];
+    for (const row of parsed.rows) {
+      const keyPath = lower ? row.key.toLowerCase() : row.key;
+      if (skipDupes && existing.has(`${namespace}\u0000${keyPath}`)) {
+        skipped++;
+        continue;
+      }
+      try {
+        await API.post('/admin/secrets', {
+          key_path: keyPath,
+          secret_type: 'KEY_VALUE',
+          value: row.value,
+          namespace: ns,
+          description: desc,
+        });
+        existing.add(`${namespace}\u0000${keyPath}`);
+        created++;
+      } catch(e) {
+        errors.push(`${row.key}: ${e.message}`);
+      }
+    }
+    button.disabled = false;
+    button.textContent = 'Import Secrets';
+    if (created) {
+      closeModal();
+      toast(`Imported ${created} secret${created === 1 ? '' : 's'}${skipped ? `, skipped ${skipped}` : ''}${errors.length ? `, ${errors.length} error${errors.length === 1 ? '' : 's'}` : ''}`, errors.length ? 'info' : 'success');
+      Secrets.load();
+    } else {
+      toast(errors.length ? errors.slice(0, 4).join('; ') : `No secrets imported${skipped ? `; skipped ${skipped}` : ''}`, 'error');
+    }
+    if (errors.length) console.warn('CortexAuth .env import errors:', errors);
   },
 
   openEdit(id, path, desc) {
