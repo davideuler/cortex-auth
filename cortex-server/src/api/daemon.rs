@@ -118,7 +118,7 @@ async fn attest(
                 details: None,
             });
         }
-        (true, Some((enabled,))) if enabled == 0 => {
+        (true, Some((0,))) => {
             audit::write(
                 &state,
                 Some(&agent_id),

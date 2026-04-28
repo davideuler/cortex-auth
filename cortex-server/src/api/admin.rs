@@ -1088,7 +1088,8 @@ async fn list_devices(
 ) -> Result<Json<Vec<Value>>, AppError> {
     check_admin_token(&headers, &state.admin_token_hash)?;
 
-    let rows: Vec<(String, String, String, Option<String>, String, Option<String>)> =
+    type DeviceRow = (String, String, String, Option<String>, String, Option<String>);
+    let rows: Vec<DeviceRow> =
         sqlx::query_as(
             "SELECT id, user_code, status, agent_id, created_at, approved_at \
              FROM pending_devices ORDER BY created_at DESC LIMIT 200",
@@ -1397,7 +1398,7 @@ async fn list_daemon_sessions(
 ) -> Result<Json<Vec<Value>>, AppError> {
     check_admin_token(&headers, &state.admin_token_hash)?;
 
-    let rows: Vec<(
+    type DaemonSessionRow = (
         String,
         String,
         String,
@@ -1408,7 +1409,8 @@ async fn list_daemon_sessions(
         String,
         String,
         Option<String>,
-    )> = sqlx::query_as(
+    );
+    let rows: Vec<DaemonSessionRow> = sqlx::query_as(
         "SELECT session_id, agent_id, binary_sha256, daemon_version, daemon_pid, \
                 daemon_uid, hostname, created_at, expires_at, revoked_at \
          FROM daemon_sessions ORDER BY created_at DESC LIMIT 200",

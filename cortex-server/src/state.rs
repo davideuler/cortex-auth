@@ -14,6 +14,12 @@ use crate::{
 /// Entries older than NONCE_WINDOW_SECS are pruned on every insert.
 pub struct NonceCache(HashMap<String, i64>);
 
+impl Default for NonceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NonceCache {
     pub fn new() -> Self {
         Self(HashMap::new())

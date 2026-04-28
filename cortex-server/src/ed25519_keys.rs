@@ -1,10 +1,10 @@
 //! Server-side Ed25519 keypair lifecycle.
 //!
 //! Used by:
-//!   * #14 — signed project tokens (`server_sign_jwt` mints EdDSA JWTs that
-//!           clients verify against the JWKS endpoint).
-//!   * #13 (server side) — verifying agent auth proofs that have an
-//!           `agent_pub` registered.
+//! * #14 — signed project tokens (`server_sign_jwt` mints EdDSA JWTs that
+//!   clients verify against the JWKS endpoint).
+//! * #13 (server side) — verifying agent auth proofs that have an
+//!   `agent_pub` registered.
 //!
 //! The server's own private key is generated on first boot and persisted
 //! envelope-encrypted under the KEK in the `server_keys` table. Public keys
