@@ -6,8 +6,9 @@
 //! SHA-256 + version to `/daemon/attest`, and gets back a `session_id`.
 //! Every subsequent sensitive HTTP request from the daemon carries an
 //! `X-Daemon-Attestation` header signed by the ephemeral private key over
-//! `(session_id, ts, jti, method, path, body_sha256)` — pinning the request
-//! to that specific running daemon process.
+//! `(session_id, ts, jti, method, path, body_sha256, auth_token_id)` —
+//! pinning the request and its Authorization bearer to that specific running
+//! daemon process.
 
 use serde::{Deserialize, Serialize};
 

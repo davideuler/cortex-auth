@@ -6,7 +6,7 @@
 //!     leaves the daemon's memory.
 //!   * `verify_attestation_header` middleware helper — every sensitive
 //!     request from a daemon must carry an `X-Daemon-Attestation` header
-//!     signed over `(session_id|ts|jti|method|path|body_sha256)`.
+//!     signed over `(session_id|ts|jti|method|path|body_sha256|auth_token_id)`.
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64URL, Engine as _};
@@ -182,13 +182,14 @@ async fn attest(
 /// Verify the `X-Daemon-Attestation` header on a sensitive request. Header
 /// format (base64url segments separated by `.`):
 ///
-///   `session_id . ts . jti . body_sha256_hex . sig`
+///   `session_id . ts . jti . body_sha256_hex . auth_token_id . sig`
 ///
 /// The signature is Ed25519 over the canonical message
-/// `"{ts}|{jti}|{method}|{path}|{body_sha256}"`. The session is looked up
-/// via `session_id` and the public key verified against the registered
-/// `attestation_pub`. `jti` is single-use (stored in
-/// `daemon_attest_seen_jti`), `ts` must be within ±5 minutes.
+/// `"{ts}|{jti}|{method}|{path}|{body_sha256}|{auth_token_id}"`. The
+/// `auth_token_id` is the bearer JWT jti or legacy bearer token hash expected
+/// by the handler. The session is looked up via `session_id` and the public
+/// key verified against the registered `attestation_pub`. `jti` is single-use
+/// (stored in `daemon_attest_seen_jti`), `ts` must be within ±5 minutes.
 ///
 /// Returns the bound `agent_id` on success — handlers can plumb that into
 /// authorization decisions.
@@ -198,15 +199,16 @@ pub async fn verify_attestation_header(
     method: &str,
     path: &str,
     body: &[u8],
+    expected_auth_token_id: &str,
 ) -> Result<String, AppError> {
     let raw = headers
         .get("x-daemon-attestation")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::Unauthorized("Missing X-Daemon-Attestation header".into()))?;
     let parts: Vec<&str> = raw.split('.').collect();
-    if parts.len() != 5 {
+    if parts.len() != 6 {
         return Err(AppError::Unauthorized(
-            "X-Daemon-Attestation must have 5 dot-separated segments".into(),
+            "X-Daemon-Attestation must have 6 dot-separated segments".into(),
         ));
     }
     let session_id = parts[0].to_string();
@@ -215,7 +217,19 @@ pub async fn verify_attestation_header(
         .map_err(|_| AppError::Unauthorized("attestation ts is not an integer".into()))?;
     let jti = parts[2].to_string();
     let body_sha256 = parts[3].to_string();
-    let sig_b64 = parts[4];
+    let auth_token_id = parts[4].to_string();
+    let sig_b64 = parts[5];
+    if subtle::ConstantTimeEq::ct_eq(
+        auth_token_id.as_bytes(),
+        expected_auth_token_id.as_bytes(),
+    )
+    .unwrap_u8()
+        != 1
+    {
+        return Err(AppError::Unauthorized(
+            "attestation auth_token_id does not match request bearer".into(),
+        ));
+    }
 
     // Drop replays / clock-skew.
     let now = Utc::now().timestamp();
@@ -229,13 +243,10 @@ pub async fn verify_attestation_header(
     let mut hasher = Sha256::new();
     hasher.update(body);
     let computed_body_sha = hex::encode(hasher.finalize());
-    if !subtle::ConstantTimeEq::ct_eq(computed_body_sha.as_bytes(), body_sha256.as_bytes())
+    if subtle::ConstantTimeEq::ct_eq(computed_body_sha.as_bytes(), body_sha256.as_bytes())
         .unwrap_u8()
-        == 1
+        != 1
     {
-        // unreachable due to negation, but kept for clarity
-    }
-    if computed_body_sha != body_sha256 {
         return Err(AppError::Unauthorized(
             "attestation body_sha256 does not match request body".into(),
         ));
@@ -282,7 +293,10 @@ pub async fn verify_attestation_header(
     let sig = Signature::from_slice(&sig_bytes)
         .map_err(|_| AppError::Unauthorized("attestation sig wrong length".into()))?;
 
-    let message = format!("{}|{}|{}|{}|{}", ts, jti, method, path, body_sha256);
+    let message = format!(
+        "{}|{}|{}|{}|{}|{}",
+        ts, jti, method, path, body_sha256, auth_token_id
+    );
     verifying
         .verify(message.as_bytes(), &sig)
         .map_err(|_| AppError::Unauthorized("attestation signature did not verify".into()))?;

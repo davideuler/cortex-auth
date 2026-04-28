@@ -10,6 +10,9 @@ pub const DEFAULT_TOKEN_TTL_MINUTES: i64 = 14 * 24 * 60;
 pub struct Project {
     pub id: String,
     pub project_name: String,
+    /// Agent that owns this project token. Set at discover time and checked
+    /// against daemon attestation on every /project/* request.
+    pub agent_id: Option<String>,
     pub project_token_hash: String,
     pub env_mappings: String,
     pub namespace: String,
@@ -27,13 +30,13 @@ pub struct Project {
     pub signed_token_jti: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DiscoverContext {
     pub project_name: String,
     pub file_content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DiscoverRequest {
     pub agent_id: String,
     pub auth_proof: String,

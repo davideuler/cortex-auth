@@ -1044,3 +1044,33 @@ fs.protected_symlinks = 1
 > 2. **服务端二进制 hash 白名单** —— 让 agent 不能自己编译"假 daemon"上来注册
 > 
 > 两者任何一项失守，整套体系就退化成"普通 Ed25519 签名 + 重放保护"，agent 偷到密钥仍能伪造。所以**部署时 systemd 配置和 sysctl 设置和密码学算法一样重要**。
+
+TODOs 2026/04/27
+
+*  daemon 持 token，CLI 不再 --token：去掉 cortex-cli run --token， contex-cli run 不再接受 --token 参数，contex-cli run 同时 agent 一样，通过 socket 发消息到 daemon 来启动运行 project。通过 daemon 来持有 project token.
+* 首次访问人工审批（兑现 README 承诺）
+   *  新增 pending_grants 表：(agent_id, project_name, requested_keys, status, requested_at, decided_at, decided_by)。
+   * 第一次 /agent/discover 命中新 (agent_id, project) 时返回 403 pending_approval，dashboard 推送通知，同时发送 outbound notification，管理员审核，勾选允许的范围后才发 token。
+   * 后续 N 天内同 (agent_id, project, scope) 自动通过；scope 扩大时再次审批。
+
+*  Daemon attestation: 进程启动时生成 attestation_priv（永不落盘），向 server 注册 attestation_pub + binary SHA-256。
+服务端维护 allowed_daemon_versions 白名单；不在白名单的 daemon 无法换 secret。
+每个敏感请求带 X-Daemon-Attestation，覆盖 (session_id, ts, jti, method, path, body_sha256)。
+
+* Daemon 同 UID 隔离
+socket 协议要求调用方在 SCM_CREDENTIALS / SO_PEERCRED 中暴露 pid → daemon 校验调用方 binary path 与 SHA-256 是否在 per-agent 允许列表里。
+Linux 上加 prctl(PR_SET_DUMPABLE, 0) + mlock 私钥 + systemd unit 提供 MemoryDenyWriteExecute=yes、NoNewPrivileges=yes、ProtectKernelTunables=yes。
+
+* 项目 ↔ 密钥 ACL
+secrets 表加 owner_project 或新建 project_secret_grants(project_id, secret_id, granted_by, granted_at)。
+/agent/discover 只返回有显式 grant 的密钥；不再"按 env 名跨 project 自动匹配"。
+提供 dashboard"批准请求中的 key"工作流。
+* Replay nonce LRU：(agent_id, nonce) 缓存 5 分钟，命中即拒绝（#4）。
+* 速率限制：tower-governor 或自实现，/agent/discover 5/min/IP，/device/authorize 1/min/IP，/device/token 5/min/device_code。
+* TLS 强制：INSECURE_HTTP=1 才允许 HTTP；否则启动时校验证书，缺则拒启。
+*  CORS 收紧：默认只允许 same-origin；dashboard 通过 CORTEX_DASHBOARD_ORIGINS 显式白名单。
+* JWT 撤销补全：/admin/projects/<n>/revoke 同时写 revoked_token_jti；管理面板批量撤销。
+* JWT body-replay 保护：每次 /project/* 请求要求 X-Cortex-Ts + X-Cortex-Nonce 由 Ed25519 签名（同 daemon attestation 复用）。
+*  honey-token 名碰撞校验：admin 创建 honey 时检查 namespace 内是否已有同名真 secret，存在则要求改名或确认。
+*  CLI 填充 X-Cortex-Caller-* 头：binary SHA-256、argv hash、cwd、git HEAD、hostname、uname。
+*  Policies 真正生效：/project/secrets 每次取 secret 都跑一次 policy 评估；存 decision 到审计行。

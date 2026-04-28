@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
     routing::{get, post},
@@ -36,8 +37,8 @@ pub fn project_router() -> Router<AppState> {
 }
 
 const PROJECT_SELECT: &str = "SELECT id, project_name, project_token_hash, env_mappings, \
-    namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti \
-    FROM projects";
+    namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti, \
+    agent_id FROM projects";
 const SECRET_SELECT_FULL: &str = "SELECT id, key_path, secret_type, encrypted_value, wrapped_dek, \
     kek_version, description, namespace, is_honey_token, created_at, updated_at FROM secrets";
 const AGENT_SELECT_FULL: &str =
@@ -178,8 +179,11 @@ fn open_secret_value(
 async fn discover(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<DiscoverRequest>,
+    body: Bytes,
 ) -> Result<Json<DiscoverResponse>, AppError> {
+    let req: DiscoverRequest = serde_json::from_slice(&body)
+        .map_err(|e| AppError::BadRequest(format!("Invalid discover JSON: {}", e)))?;
+
     // ── Rate limiting: 5 /agent/discover per minute per source IP ────────
     let source_ip = extract_source_ip(&headers);
     if !state
@@ -221,6 +225,23 @@ async fn discover(
     )
     .map_err(|_| AppError::Unauthorized("Invalid Ed25519 auth_proof".into()))?;
 
+    if state.config.require_request_signing {
+        let attested_agent_id = crate::api::daemon::verify_attestation_header(
+            &state,
+            &headers,
+            "POST",
+            "/agent/discover",
+            &body,
+            &format!("agent:{}", req.agent_id),
+        )
+        .await?;
+        if attested_agent_id != req.agent_id {
+            return Err(AppError::Unauthorized(
+                "daemon attestation agent_id does not match discover agent_id".into(),
+            ));
+        }
+    }
+
     // ── Nonce replay protection ───────────────────────────────────────────
     {
         let cache_key = format!("{}:{}", req.agent_id, nonce);
@@ -254,14 +275,9 @@ async fn discover(
         .collect();
 
     // ── Build env_mappings ────────────────────────────────────────────────
-    // Priority: explicit project_secret_grants → fall back to name matching.
-    //
-    // When at least one grant exists for (project_name, namespace), ONLY those
-    // secrets are visible. This eliminates the implicit cross-project exposure
-    // from env-name normalization (DESIGN: explicit ACL).
-    //
-    // When no grants exist (new project or pre-migration), the legacy
-    // name-matching path runs so existing integrations keep working.
+    // Explicit ACL only: env vars are mapped from project_secret_grants.
+    // Name-based matching is intentionally not used as an authorization
+    // boundary.
 
     let grant_rows: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT s.key_path, g.env_var_name \
@@ -277,65 +293,34 @@ async fn discover(
     let mut mapped_keys: HashMap<String, String> = HashMap::new();
     let mut unmatched: Vec<String> = Vec::new();
 
-    if !grant_rows.is_empty() {
-        // Grant-based mapping: only explicitly granted secrets are accessible.
-        let grant_map: HashMap<String, String> = grant_rows
-            .iter()
-            .map(|(key_path, env_var)| {
-                let var = env_var
-                    .as_deref()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| v.to_uppercase())
-                    .unwrap_or_else(|| {
-                        key_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(key_path.as_str())
-                            .to_uppercase()
-                    });
-                (var, key_path.clone())
-            })
-            .collect();
+    let grant_map: HashMap<String, String> = grant_rows
+        .iter()
+        .map(|(key_path, env_var)| {
+            let var = env_var
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_uppercase())
+                .unwrap_or_else(|| {
+                    key_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(key_path.as_str())
+                        .to_uppercase()
+                });
+            (var, key_path.clone())
+        })
+        .collect();
 
-        for env_key in &env_keys {
-            // Case-insensitive lookup against grant_map keys.
-            let upper = env_key.to_uppercase();
-            if let Some(secret_path) = grant_map.get(&upper) {
-                // Apply policy filter.
-                if path_allowed_by_policies(secret_path, &matching_policies) {
-                    mapped_keys.insert(env_key.clone(), secret_path.clone());
-                } else {
-                    unmatched.push(env_key.clone());
-                }
-            } else {
-                unmatched.push(env_key.clone());
-            }
-        }
-    } else {
-        // Legacy name-based matching (backward compat).
-        let secrets = sqlx::query_as::<_, crate::models::secret::Secret>(
-            &format!(
-                "{} WHERE secret_type = 'KEY_VALUE' AND namespace = ?",
-                SECRET_SELECT_FULL
-            ),
-        )
-        .bind(&namespace)
-        .fetch_all(&state.pool)
-        .await?;
-
-        let secret_map: HashMap<String, String> = secrets
-            .iter()
-            .filter(|s| path_allowed_by_policies(&s.key_path, &matching_policies))
-            .map(|s| (s.key_path.to_lowercase().replace('/', "_"), s.key_path.clone()))
-            .collect();
-
-        for env_key in &env_keys {
-            let normalized = env_key.to_lowercase();
-            if let Some(secret_path) = secret_map.get(&normalized) {
+    for env_key in &env_keys {
+        let upper = env_key.to_uppercase();
+        if let Some(secret_path) = grant_map.get(&upper) {
+            if path_allowed_by_policies(secret_path, &matching_policies) {
                 mapped_keys.insert(env_key.clone(), secret_path.clone());
             } else {
                 unmatched.push(env_key.clone());
             }
+        } else {
+            unmatched.push(env_key.clone());
         }
     }
 
@@ -347,6 +332,33 @@ async fn discover(
     .bind(project_name)
     .fetch_optional(&state.pool)
     .await?;
+
+    if let Some(existing_proj) = &existing {
+        match existing_proj.agent_id.as_deref() {
+            Some(owner_agent) if owner_agent == agent_id => {}
+            Some(_) => {
+                return Err(AppError::Forbidden {
+                    code: "project_agent_mismatch",
+                    message: format!(
+                        "Project '{}' is bound to a different agent.",
+                        project_name
+                    ),
+                    details: None,
+                });
+            }
+            None => {
+                return Err(AppError::Forbidden {
+                    code: "project_no_agent_binding",
+                    message: format!(
+                        "Project '{}' exists but has no bound agent. An admin must \
+                         bind it via migration or re-creation before it can be discovered.",
+                        project_name
+                    ),
+                    details: None,
+                });
+            }
+        }
+    }
 
     let now = Utc::now();
     let expires_at = now + Duration::minutes(DEFAULT_TOKEN_TTL_MINUTES);
@@ -443,7 +455,7 @@ async fn discover(
             sqlx::query(
                 "UPDATE projects SET project_token_hash = ?, env_mappings = ?, namespace = ?, \
                  scope = ?, token_expires_at = ?, token_revoked_at = NULL, signed_token_jti = ?, \
-                 updated_at = datetime('now') WHERE project_name = ?",
+                 agent_id = ?, updated_at = datetime('now') WHERE project_name = ?",
             )
             .bind(&hash)
             .bind(&mappings_json)
@@ -451,6 +463,7 @@ async fn discover(
             .bind(&scope_json)
             .bind(&expires_at_str)
             .bind(&new_jti)
+            .bind(&agent_id)
             .bind(project_name)
             .execute(&state.pool)
             .await?;
@@ -484,11 +497,12 @@ async fn discover(
         let mappings_json = serde_json::to_string(&mapped_keys).unwrap();
 
         sqlx::query(
-            "INSERT INTO projects (id, project_name, project_token_hash, env_mappings, \
-             namespace, scope, token_expires_at, signed_token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO projects (id, project_name, agent_id, project_token_hash, env_mappings, \
+             namespace, scope, token_expires_at, signed_token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(project_name)
+        .bind(&agent_id)
         .bind(&hash)
         .bind(&mappings_json)
         .bind(&namespace)
@@ -630,11 +644,16 @@ async fn check_or_create_pending_grant(
 
 const _AUTO_APPROVAL_WINDOW_DAYS: i64 = AUTO_APPROVAL_WINDOW_DAYS;
 
+struct VerifiedProject {
+    project: crate::models::project::Project,
+    auth_token_id: String,
+}
+
 async fn get_project_by_token(
     state: &AppState,
     project_name: &str,
     token: &str,
-) -> Result<crate::models::project::Project, AppError> {
+) -> Result<VerifiedProject, AppError> {
     let project = sqlx::query_as::<_, crate::models::project::Project>(
         &format!("{} WHERE project_name = ?", PROJECT_SELECT),
     )
@@ -643,6 +662,7 @@ async fn get_project_by_token(
     .await?
     .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", project_name)))?;
 
+    let mut auth_token_id = crypto::hash_token(token);
     let token_ok = if token.matches('.').count() == 2 {
         match crate::ed25519_keys::verify_jwt::<serde_json::Value>(&state.server_keypair, token) {
             Ok(claims) => {
@@ -655,6 +675,7 @@ async fn get_project_by_token(
                     return Err(AppError::Unauthorized("token sub != project".into()));
                 }
                 if let Some(jti) = claims.get("jti").and_then(|v| v.as_str()) {
+                    auth_token_id = jti.to_string();
                     let revoked: Option<(String,)> = sqlx::query_as(
                         "SELECT jti FROM revoked_token_jti WHERE jti = ?",
                     )
@@ -703,7 +724,10 @@ async fn get_project_by_token(
         return Err(AppError::token_expired());
     }
 
-    Ok(project)
+    Ok(VerifiedProject {
+        project,
+        auth_token_id,
+    })
 }
 
 async fn get_secrets(
@@ -714,21 +738,33 @@ async fn get_secrets(
     let token = extract_bearer_token(&headers)?;
     let caller = extract_caller_context(&headers);
 
-    // ── Optional body-replay protection ──────────────────────────────────
-    // When CORTEX_REQUIRE_REQUEST_SIGNING=1 the request must carry a valid
-    // X-Daemon-Attestation header (same format as /daemon/attest uses).
+    let verified = get_project_by_token(&state, &project_name, &token).await?;
+    let project = verified.project;
+
     if state.config.require_request_signing {
-        crate::api::daemon::verify_attestation_header(
+        let attested_agent_id = crate::api::daemon::verify_attestation_header(
             &state,
             &headers,
             "GET",
             &format!("/project/secrets/{}", project_name),
             &[],
+            &verified.auth_token_id,
         )
         .await?;
+        match project.agent_id.as_deref() {
+            Some(owner_agent) if owner_agent == attested_agent_id => {}
+            Some(_) => {
+                return Err(AppError::Unauthorized(
+                    "daemon attestation agent_id does not match project owner".into(),
+                ));
+            }
+            None => {
+                return Err(AppError::Unauthorized(
+                    "project has no bound agent_id; rediscover the project before access".into(),
+                ));
+            }
+        }
     }
-
-    let project = get_project_by_token(&state, &project_name, &token).await?;
 
     // ── Load policies keyed to the project_name ───────────────────────────
     // Policies are evaluated per-path on every fetch so access can be
@@ -874,18 +910,33 @@ async fn get_config(
     let token = extract_bearer_token(&headers)?;
     let caller = extract_caller_context(&headers);
 
+    let verified = get_project_by_token(&state, &project_name, &token).await?;
+    let project = verified.project;
+
     if state.config.require_request_signing {
-        crate::api::daemon::verify_attestation_header(
+        let attested_agent_id = crate::api::daemon::verify_attestation_header(
             &state,
             &headers,
             "GET",
             &format!("/project/config/{}/{}", project_name, app_name),
             &[],
+            &verified.auth_token_id,
         )
         .await?;
+        match project.agent_id.as_deref() {
+            Some(owner_agent) if owner_agent == attested_agent_id => {}
+            Some(_) => {
+                return Err(AppError::Unauthorized(
+                    "daemon attestation agent_id does not match project owner".into(),
+                ));
+            }
+            None => {
+                return Err(AppError::Unauthorized(
+                    "project has no bound agent_id; rediscover the project before access".into(),
+                ));
+            }
+        }
     }
-
-    let project = get_project_by_token(&state, &project_name, &token).await?;
 
     let template_secret = sqlx::query_as::<_, crate::models::secret::Secret>(
         &format!(

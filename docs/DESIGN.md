@@ -21,7 +21,7 @@ it fits together, and what is intentionally deferred.
 │  ┌─────────────────┐   ┌──────────────────┐   ┌──────────────┐ │
 │  │   Admin API     │   │   Agent API      │   │  Project API │ │
 │  │   /admin/*      │   │  /agent/discover │   │ /project/*   │ │
-│  │   X-Admin-Token │   │  Ed25519 / HS256 │   │ Bearer token │ │
+│  │   X-Admin-Token │   │  Ed25519         │   │ Bearer token │ │
 │  └─────────────────┘   └──────────────────┘   └──────────────┘ │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
@@ -151,9 +151,8 @@ Axum HTTP service backed by SQLite via sqlx.
   visibility / revocation.
 
 ### 5. cortex-cli + cortex-daemon
-- **cortex-cli run** — fetches `/project/secrets/<name>` and `exec()`s the
-  child with the env vars injected. The CLI process is *replaced* by the
-  child, so a parent process cannot scrape the env from the CLI's pid.
+- **cortex-cli run** — sends a `run` request to `cortex-daemon` over the
+  Unix socket. The CLI no longer accepts or holds project tokens.
 - **cortex-cli gen-key** — generates an Ed25519 keypair locally; private
   key is mode 0600 in `~/.cortex/agent-<id>.key`.
 - **cortex-cli sign-proof** — signs an Ed25519 auth_proof with the local
@@ -162,7 +161,7 @@ Axum HTTP service backed by SQLite via sqlx.
   client.
 - **cortex-daemon** — long-running socket service at `~/.cortex/agent.sock`
   (mode 0600). Single-line JSON protocol: `{"cmd":"status"}` or
-  `{"cmd":"run","program":..,"args":..,"project":..,"token":..,"url":..}`.
+  `{"cmd":"run","program":..,"args":..,"project":..,"url":..}`.
   Secrets stay in the child process environment and never cross the socket
   back to the caller.
 
@@ -173,21 +172,12 @@ Axum HTTP service backed by SQLite via sqlx.
 Admin → POST /admin/secrets {key_path, value, ...}
 Agent → cortex-cli gen-key → uploads agent_pub via POST /admin/agents
 Agent → cortex-cli sign-proof → POST /agent/discover {agent_id, ts, nonce,
-        auth_proof: <ed25519-sig>, context, signed_token: true}
-Server → verifies Ed25519 sig → matches env vars → mints EdDSA JWT
+        auth_proof: <ed25519-sig>, context, signed_token: true,
+        X-Daemon-Attestation}
+Server → verifies Ed25519 sig + daemon attestation → applies explicit
+       project_secret_grants → mints scoped token
        → returns project_token (legacy random) AND signed_project_token
-Agent → cortex-cli run --token $signed_project_token -- ./start.sh
-```
-
-### Runtime (cortex-cli, no daemon)
-```
-cortex-cli run --project P --token T --url U -- ./start.sh
-→ GET /project/secrets/P (Bearer T)
-   - server detects T format (3 dot-separated parts → JWT verification;
-     hex random → SHA-256 hash compare)
-   - applies frozen scope, decrypts envelopes, returns env vars
-→ injects {KEY: value, ...} into env
-→ exec("./start.sh") with the injected environment
+Daemon caches token internally; CLI never receives it.
 ```
 
 ### Runtime (cortex-daemon)
@@ -196,7 +186,11 @@ cortex-cli daemon login --url U     # OAuth 2.0 device flow
 human → /device → approves user_code (binds it to an agent_id)
 cortex-daemon                       # listens on ~/.cortex/agent.sock
 peer  → echo '{"cmd":"run", ...}' | nc -U ~/.cortex/agent.sock
-       daemon spawns the child with secrets injected; exits with the child's code.
+daemon → GET /project/secrets/P (Bearer T + X-Daemon-Attestation)
+       - attestation covers method, path, body hash, and bearer token id
+       - daemon session agent_id must match the project owner
+       - server applies frozen scope and runtime policy checks
+daemon → spawns the child with secrets injected; exits with the child's code.
 ```
 
 ### Recovery Boot
@@ -221,7 +215,7 @@ policies             (id, policy_name, agent_pattern, allowed_paths,
                       denied_paths, created_at)
 projects             (id, project_name, project_token_hash, env_mappings,
                       namespace, scope, token_expires_at, token_revoked_at,
-                      created_at, updated_at)
+                      signed_token_jti, agent_id, created_at, updated_at)
 namespaces           (name, description, created_at)
 audit_logs           (id, agent_id, project_name, action, resource_path,
                       status, timestamp, caller_pid, caller_binary_sha256,
@@ -238,6 +232,17 @@ server_keys          (kid, signing_key_ciphertext, signing_key_wrapped_dek,
 pending_devices      (id, device_code, user_code, status, agent_id,
                       expires_at, created_at, approved_at)
 revoked_token_jti    (jti, revoked_at)
+pending_grants       (id, agent_id, project_name, namespace, requested_keys,
+                      approved_keys, status, requested_at, decided_at,
+                      decided_by, auto_approval_until, source_ip)
+project_secret_grants(id, project_name, secret_id, env_var_name,
+                      granted_by, granted_at)
+daemon_sessions      (session_id, agent_id, attestation_pub, binary_sha256,
+                      daemon_version, daemon_pid, daemon_uid, hostname,
+                      created_at, expires_at, revoked_at)
+allowed_daemon_versions(binary_sha256, version, description, enabled,
+                        created_at)
+daemon_attest_seen_jti (jti, seen_at)
 ```
 
 ## Security Properties
@@ -250,8 +255,9 @@ revoked_token_jti    (jti, revoked_at)
 - KEK is derived with Argon2id from the operator password (or reconstructed
   from Shamir shares in recovery mode); never persisted to disk.
 - Project tokens: SHA-256 hashed random tokens, or EdDSA-signed JWTs when
-  the caller passes `signed_token: true`. Constant-time comparison via
-  `subtle::ConstantTimeEq`.
+  the caller passes `signed_token: true`. Every project token is bound to
+  the discovering agent and `/project/*` requires a matching daemon
+  attestation by default.
 - Audit log is HMAC-SHA256-chained — tampering is detectable.
 - `cortex-cli` uses `exec()`; the parent process is *replaced*.
 - `cortex-daemon` keeps the access token in its own process; peers cannot
@@ -259,7 +265,7 @@ revoked_token_jti    (jti, revoked_at)
   ask the daemon to spawn a child.
 - Outbound notifications use rustls for HTTPS endpoints and pipe email via
   himalaya-cli on stdin (no shell expansion of message content).
-- TLS terminated in-process when `TLS_CERT_FILE` + `TLS_KEY_FILE` are set.
+- TLS is required by default. Plain HTTP requires `INSECURE_HTTP=1`.
 
 ## Roadmap
 
@@ -267,13 +273,11 @@ What is **implemented today** (this doc): envelope encryption, KEK rotation,
 honey tokens, tamper-evident audit log, scoped project tokens, namespaces,
 Ed25519 agent identity, Ed25519-signed project tokens with JWKS, Shamir
 m-of-n recovery, OAuth 2.0 device authorization, cortex-daemon scaffolding,
-notification dispatch (Slack/Discord/Telegram/email-via-himalaya).
+notification dispatch (Slack/Discord/Telegram/email-via-himalaya), daemon
+attestation, explicit project-secret grants, nonce replay protection, and
+authentication endpoint rate limiting.
 
-What is **deferred** (see [UNCERTAINTIES.md](UNCERTAINTIES.md) #11, #17,
-#18, #19, #21):
+What is **deferred**:
 - `cortex-cli verify-audit` chain-replay tool.
-- Daemon attestation header (#17) — per-process attestation key checked
-  against an allowed-binaries whitelist.
 - Multi-user RBAC for the admin API (#18).
 - External anchoring of the audit chain tail (e.g. periodic Git pin).
-- CLI population of `X-Cortex-Caller-*` headers (#21).

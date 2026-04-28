@@ -14,8 +14,10 @@ pub struct AppConfig {
     /// origins (e.g. "https://admin.example.com,https://dash.example.com").
     /// Defaults to same-origin only (empty = deny all cross-origin requests).
     pub dashboard_origins: Vec<String>,
-    /// When true /project/* endpoints require a valid X-Daemon-Attestation
-    /// header (daemon Ed25519 request signing). Set CORTEX_REQUIRE_REQUEST_SIGNING=1.
+    /// When true sensitive endpoints require a valid X-Daemon-Attestation
+    /// header (daemon Ed25519 request signing). Enabled by default; set
+    /// CORTEX_DISABLE_REQUEST_SIGNING=1 only for tests or emergency legacy
+    /// compatibility.
     pub require_request_signing: bool,
 }
 
@@ -44,8 +46,8 @@ impl AppConfig {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let require_request_signing = matches!(
-            std::env::var("CORTEX_REQUIRE_REQUEST_SIGNING")
+        let require_request_signing = !matches!(
+            std::env::var("CORTEX_DISABLE_REQUEST_SIGNING")
                 .ok()
                 .as_deref(),
             Some("1") | Some("true") | Some("TRUE") | Some("yes")

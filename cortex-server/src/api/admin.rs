@@ -543,7 +543,7 @@ async fn list_projects(
     check_admin_token(&headers, &state.admin_token_hash)?;
 
     let rows = sqlx::query_as::<_, crate::models::project::Project>(
-        "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti FROM projects ORDER BY created_at",
+        "SELECT id, project_name, project_token_hash, env_mappings, namespace, scope, created_at, updated_at, token_expires_at, token_revoked_at, signed_token_jti, agent_id FROM projects ORDER BY created_at",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -582,9 +582,7 @@ async fn revoke_project_token(
     .fetch_optional(&state.pool)
     .await?;
     if let Some((Some(jti),)) = jti_row {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO revoked_token_jti (jti, reason) VALUES (?, 'admin_revoke')",
-        )
+        let _ = sqlx::query("INSERT OR IGNORE INTO revoked_token_jti (jti) VALUES (?)")
         .bind(&jti)
         .execute(&state.pool)
         .await;
@@ -1507,18 +1505,7 @@ async fn create_project_grant(
         AppError::NotFound(format!("Secret '{}' not found", req.secret_id))
     })?;
 
-    // Verify project exists.
-    let proj_exists: Option<(String,)> =
-        sqlx::query_as("SELECT project_name FROM projects WHERE project_name = ?")
-            .bind(&project_name)
-            .fetch_optional(&state.pool)
-            .await?;
-    if proj_exists.is_none() {
-        return Err(AppError::NotFound(format!(
-            "Project '{}' not found",
-            project_name
-        )));
-    }
+    // Grants can be staged before the first discover creates the project row.
 
     let id = uuid::Uuid::new_v4().to_string();
     sqlx::query(

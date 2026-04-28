@@ -381,7 +381,9 @@ async fn discover_token_attested(
     let body_bytes = serde_json::to_vec(&body_val)
         .context("serialize discover body")
         .map_err(RunError::Other)?;
-    let attest = make_attestation_header(ctx, "POST", "/agent/discover", &body_bytes);
+    let auth_token_id = format!("agent:{}", ctx.agent_id);
+    let attest =
+        make_attestation_header(ctx, "POST", "/agent/discover", &body_bytes, &auth_token_id);
 
     let url = format!("{}/agent/discover", ctx.server_url);
     let mut req = client
@@ -464,7 +466,8 @@ async fn fetch_secrets_attested(
 ) -> Result<HashMap<String, String>> {
     let path = format!("/project/secrets/{}", project_name);
     let url = format!("{}{}", ctx.server_url, path);
-    let attest = make_attestation_header(ctx, "GET", &path, b"");
+    let auth_token_id = bearer_auth_token_id(token);
+    let attest = make_attestation_header(ctx, "GET", &path, b"", &auth_token_id);
 
     let mut req = client
         .get(&url)
@@ -534,19 +537,50 @@ fn build_caller_headers(ctx: &AttestCtx) -> Vec<(&'static str, String)> {
 
 // ── Attestation helpers ──────────────────────────────────────────────────────
 
-fn make_attestation_header(ctx: &AttestCtx, method: &str, path: &str, body: &[u8]) -> String {
+fn make_attestation_header(
+    ctx: &AttestCtx,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth_token_id: &str,
+) -> String {
     let ts = chrono::Utc::now().timestamp();
     let jti = uuid::Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
     hasher.update(body);
     let body_sha256 = hex::encode(hasher.finalize());
-    let message = format!("{}|{}|{}|{}|{}", ts, jti, method, path, body_sha256);
+    let message = format!(
+        "{}|{}|{}|{}|{}|{}",
+        ts, jti, method, path, body_sha256, auth_token_id
+    );
     let sig = ctx.attest_key.sign(message.as_bytes());
     let sig_b64 = B64URL.encode(sig.to_bytes());
     format!(
-        "{}.{}.{}.{}.{}",
-        ctx.session_id, ts, jti, body_sha256, sig_b64
+        "{}.{}.{}.{}.{}.{}",
+        ctx.session_id, ts, jti, body_sha256, auth_token_id, sig_b64
     )
+}
+
+fn bearer_auth_token_id(token: &str) -> String {
+    if token.matches('.').count() == 2 {
+        if let Some(jti) = jwt_jti(token) {
+            return jti;
+        }
+    }
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+fn jwt_jti(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let payload = B64URL.decode(parts[1].as_bytes()).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims
+        .get("jti")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 async fn register_attestation(

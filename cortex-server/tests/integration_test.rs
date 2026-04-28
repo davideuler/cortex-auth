@@ -99,6 +99,61 @@ async fn register_agent(app: &axum::Router, agent_id: &str, agent_pub: &str) {
     assert_eq!(resp.status(), StatusCode::CREATED, "agent registration must succeed");
 }
 
+async fn ensure_test_project_grants(app: &axum::Router, project: &str, file_content: &str) {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/admin/secrets")
+        .header("x-admin-token", "test-admin-token")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let secrets = body_json(resp.into_body()).await;
+
+    let env_keys: Vec<String> = file_content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line).trim();
+            (!key.is_empty()).then(|| key.to_string())
+        })
+        .collect();
+
+    for env_key in env_keys {
+        let normalized = env_key.to_lowercase();
+        let secret = secrets.as_array().and_then(|arr| {
+            arr.iter().find(|s| {
+                s.get("key_path")
+                    .and_then(|v| v.as_str())
+                    .map(|p| p.to_lowercase().replace('/', "_") == normalized)
+                    .unwrap_or(false)
+            })
+        });
+        let Some(secret) = secret else {
+            continue;
+        };
+        let secret_id = secret["id"].as_str().unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri(&format!("/admin/projects/{}/grants", project))
+            .header("content-type", "application/json")
+            .header("x-admin-token", "test-admin-token")
+            .body(Body::from(
+                json!({"secret_id": secret_id, "env_var_name": env_key}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::CREATED || resp.status() == StatusCode::CONFLICT,
+            "grant staging failed: {}",
+            body_json(resp.into_body()).await
+        );
+    }
+}
+
 /// Perform `/agent/discover`, auto-approving any pending grant so tests do not
 /// need to be aware of the first-access approval flow introduced in #16.
 /// Returns `(final_status, response_body)` — status reflects the result
@@ -111,6 +166,8 @@ async fn discover_and_approve(
     file_content: &str,
     regenerate: bool,
 ) -> (StatusCode, Value) {
+    ensure_test_project_grants(app, project, file_content).await;
+
     let body_str =
         discover_body(keypair, agent_id, project, file_content, regenerate).to_string();
     let req = Request::builder()
@@ -1086,6 +1143,7 @@ async fn test_token_status_helper() {
         ),
         token_revoked_at: None,
         signed_token_jti: None,
+        agent_id: None,
     };
     assert_eq!(p.token_status(), "active");
 
